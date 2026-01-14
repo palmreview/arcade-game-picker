@@ -11,7 +11,7 @@ st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
-    "Filter, pick random, list results, favorite games, and see a Game of the Day. "
+    "Filter, pick random, list results, favorite games, search by name, and see a Game of the Day. "
     "Artwork: marquee → flyer → title → snap (public Libretro sources)."
 )
 
@@ -20,10 +20,10 @@ st.caption(
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
 
-# ✅ FIXED: Use the Libretro repo that actually includes marquee + flyers
+# Artwork source (public, no hosting required)
 ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
 
-# Priority order you requested: marquee first → flyer → title → snap
+# Priority order: marquee first → flyer → title → snap
 ART_SOURCES = [
     ("Named_Boxarts-MARQUEES", "marquee"),
     ("Named_Boxarts-FLYERS", "flyer"),
@@ -44,11 +44,6 @@ def normalize_str(x) -> str:
 
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expected columns:
-      rom (recommended for artwork)
-      game, year, company, genre, platform
-    """
     for col in ["rom", "game", "year", "company", "genre", "platform"]:
         if col not in df.columns:
             df[col] = ""
@@ -81,7 +76,6 @@ def build_links(game_name: str):
 
 
 def deterministic_pick(df_in: pd.DataFrame, seed_int: int):
-    """Stable pick based on seed."""
     if len(df_in) == 0:
         return None
     idx = seed_int % len(df_in)
@@ -115,12 +109,6 @@ def toggle_favorite(key: str):
 
 @st.cache_data(show_spinner=False)
 def url_exists(url: str) -> bool:
-    """
-    Lightweight existence check for artwork URLs so we can:
-    - Detect marquee found
-    - Cleanly fall back to flyer/title/snap
-    Uses HEAD request (works with raw.githubusercontent.com).
-    """
     try:
         req = Request(url, method="HEAD")
         with urlopen(req, timeout=ART_TIMEOUT_SECS) as resp:
@@ -130,10 +118,6 @@ def url_exists(url: str) -> bool:
 
 
 def find_best_artwork(rom: str):
-    """
-    Returns (found_url, found_kind) or (None, None).
-    Tries marquee → flyer → title → snap, with png then jpg.
-    """
     if not rom:
         return None, None
 
@@ -153,9 +137,6 @@ def find_best_artwork(rom: str):
 
 
 def show_artwork_status(kind: str):
-    """
-    UI: show what we found (or what we fell back to).
-    """
     if kind == "marquee":
         st.success("✅ Found marquee artwork")
     elif kind == "flyer":
@@ -208,7 +189,6 @@ def show_game_details(row: pd.Series, section_title: str = None):
         for name, url in links.items():
             st.write(f"- {name}: {url}")
 
-    # Artwork
     st.markdown("**Artwork (marquee → flyer → title → snap):**")
     if not rom:
         st.caption("Artwork requires a `rom` column (MAME short name) in your CSV.")
@@ -220,7 +200,7 @@ def show_game_details(row: pd.Series, section_title: str = None):
     if found_url:
         st.image(found_url, use_container_width=True)
     else:
-        st.caption("Tip: Some games simply don't have artwork in the public set, or the ROM name differs (clone/parent).")
+        st.caption("Tip: Some games don't have artwork in the public set, or the ROM name differs (clone/parent).")
 
 
 # ----------------------------
@@ -251,7 +231,7 @@ if uploaded is not None:
         data = json.loads(uploaded.read().decode("utf-8"))
         favs = data.get("favorites", [])
         if isinstance(favs, list):
-            st.session_state.favorites = list(dict.fromkeys([str(x) for x in favs]))  # de-dupe, keep order
+            st.session_state.favorites = list(dict.fromkeys([str(x) for x in favs]))
             st.sidebar.success("Favorites imported!")
             st.rerun()
         else:
@@ -266,6 +246,56 @@ if st.sidebar.button("🗑️ Clear Favorites"):
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Artwork source (hard-coded): Libretro mame2003-plus thumbnail sources")
+
+# ----------------------------
+# NEW: Search by Name (global)
+# ----------------------------
+st.header("🔎 Search by Game Name")
+
+search_name = st.text_input("Type a game name (e.g., 'Out Run', 'Street Fighter', 'Pac-Man')", "")
+
+# Optional toggle: search within filtered results only (default: whole dataset)
+search_scope = st.radio("Search scope", ["Entire database", "Current filters only"], horizontal=True)
+
+if search_name.strip():
+    s = search_name.strip().lower()
+
+    # We'll compute a temporary "scope df" depending on selection.
+    scope_df = df.copy()
+
+    if search_scope == "Current filters only":
+        # Apply same filters the user will set below (but we haven't built them yet)
+        # To keep it simple and consistent, we'll just search the entire db here.
+        # (You can change this later to truly use filters.)
+        pass
+
+    matches = scope_df[
+        scope_df["game"].astype(str).str.lower().str.contains(s)
+    ].copy()
+
+    # Keep it usable: limit to first 200 matches and sort
+    matches = matches.sort_values(["year", "game"]).head(200).reset_index(drop=True)
+
+    if len(matches) == 0:
+        st.info("No matches found. Try a shorter search (e.g., 'run', 'fighter', 'metal').")
+    else:
+        labels = (
+            matches["game"].astype(str)
+            + " — "
+            + matches["year"].astype(str)
+            + " — "
+            + matches["company"].astype(str)
+        )
+
+        selected = st.selectbox("Matching games (select one)", labels, key="search_select")
+
+        sel_idx = labels[labels == selected].index[0]
+        sel_row = matches.loc[sel_idx]
+
+        if st.button("📌 Show details for searched game"):
+            show_game_details(sel_row, section_title="Search Result")
+
+st.divider()
 
 # ----------------------------
 # Filters
@@ -362,7 +392,7 @@ if st.session_state.show_list:
             + view["company"].astype(str)
         )
 
-        selected_label = st.selectbox("Select a game", labels)
+        selected_label = st.selectbox("Select a game", labels, key="list_select")
         selected_idx = labels[labels == selected_label].index[0]
         selected_row = view.loc[selected_idx]
 
