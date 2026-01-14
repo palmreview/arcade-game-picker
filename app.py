@@ -1,6 +1,8 @@
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import pandas as pd
 import streamlit as st
@@ -10,24 +12,26 @@ st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Filter, pick random, list results, favorite games, and see a Game of the Day. "
-    "Artwork: marquee → flyer → title → snap (Libretro thumbnails)."
+    "Artwork: marquee → flyer → title → snap (public Libretro sources)."
 )
 
 # ----------------------------
-# Constants (Option B: hard-coded artwork source)
+# Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
 
-# Hard-coded public artwork source (no sidebar input required)
-ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/MAME/master"
+# ✅ FIXED: Use the Libretro repo that actually includes marquee + flyers
+ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
 
-# Priority order you requested: marquee first, then flyer, then title screen, then snap
-ART_PATHS = [
-    "Named_Marquees",  # marquee
-    "Named_Flyers",    # flyer
-    "Named_Titles",    # title screen
-    "Named_Snaps",     # snap / screenshot
+# Priority order you requested: marquee first → flyer → title → snap
+ART_SOURCES = [
+    ("Named_Boxarts-MARQUEES", "marquee"),
+    ("Named_Boxarts-FLYERS", "flyer"),
+    ("Named_Titles", "title"),
+    ("Named_Snaps", "snap"),
 ]
+
+ART_TIMEOUT_SECS = 4
 
 
 # ----------------------------
@@ -49,7 +53,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
 
-    df["rom"] = df["rom"].map(normalize_str)
+    df["rom"] = df["rom"].map(normalize_str).str.lower()
     df["game"] = df["game"].map(normalize_str)
     df["company"] = df["company"].map(normalize_str)
     df["genre"] = df["genre"].map(normalize_str)
@@ -58,18 +62,13 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["year"] = pd.to_numeric(df["year"], errors="coerce")
     df = df.dropna(subset=["game", "year"]).copy()
     df["year"] = df["year"].astype(int)
-
-    # Normalize rom key (libretro filenames are typically lowercase)
-    df["rom"] = df["rom"].astype(str).str.strip().str.lower()
-
     return df
 
 
 @st.cache_data
 def load_games():
     df = pd.read_csv("arcade_games_1978_2008_clean.csv")
-    df = ensure_columns(df)
-    return df
+    return ensure_columns(df)
 
 
 def build_links(game_name: str):
@@ -93,12 +92,10 @@ def init_state():
     if "show_list" not in st.session_state:
         st.session_state.show_list = False
     if "favorites" not in st.session_state:
-        # store rom ids when available, otherwise store "game|year|company"
         st.session_state.favorites = []
 
 
 def game_key(row: pd.Series) -> str:
-    # Prefer ROM shortname (best unique key)
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
@@ -116,19 +113,59 @@ def toggle_favorite(key: str):
         st.session_state.favorites.append(key)
 
 
-def artwork_candidates_for_rom(rom: str) -> list[str]:
+@st.cache_data(show_spinner=False)
+def url_exists(url: str) -> bool:
     """
-    Option B: Use public Libretro thumbnails for MAME.
-    Tries in order: marquee → flyer → title → snap.
+    Lightweight existence check for artwork URLs so we can:
+    - Detect marquee found
+    - Cleanly fall back to flyer/title/snap
+    Uses HEAD request (works with raw.githubusercontent.com).
+    """
+    try:
+        req = Request(url, method="HEAD")
+        with urlopen(req, timeout=ART_TIMEOUT_SECS) as resp:
+            return 200 <= resp.status < 400
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return False
+
+
+def find_best_artwork(rom: str):
+    """
+    Returns (found_url, found_kind) or (None, None).
+    Tries marquee → flyer → title → snap, with png then jpg.
     """
     if not rom:
-        return []
-    rom = rom.strip().lower()
+        return None, None
+
     base = ART_BASE_URL.rstrip("/")
-    urls = []
-    for folder in ART_PATHS:
-        urls.append(f"{base}/{folder}/{rom}.png")
-    return urls
+    rom = rom.strip().lower()
+
+    for folder, kind in ART_SOURCES:
+        png = f"{base}/{folder}/{rom}.png"
+        if url_exists(png):
+            return png, kind
+
+        jpg = f"{base}/{folder}/{rom}.jpg"
+        if url_exists(jpg):
+            return jpg, kind
+
+    return None, None
+
+
+def show_artwork_status(kind: str):
+    """
+    UI: show what we found (or what we fell back to).
+    """
+    if kind == "marquee":
+        st.success("✅ Found marquee artwork")
+    elif kind == "flyer":
+        st.info("➡️ Marquee not found — using flyer fallback")
+    elif kind == "title":
+        st.info("➡️ Marquee/flyer not found — using title screen fallback")
+    elif kind == "snap":
+        st.info("➡️ Marquee/flyer/title not found — using gameplay snapshot fallback")
+    else:
+        st.warning("⚠️ No artwork found in the public source for this ROM")
 
 
 def show_game_details(row: pd.Series, section_title: str = None):
@@ -171,28 +208,19 @@ def show_game_details(row: pd.Series, section_title: str = None):
         for name, url in links.items():
             st.write(f"- {name}: {url}")
 
-    # Artwork (marquee → flyer → title → snap)
-    if rom:
-        st.markdown("**Artwork (marquee → flyer → title → snap):**")
-
-        # We attempt each URL; if it fails, try next.
-        # Streamlit will show the image if the URL resolves; otherwise it may error.
-        # We catch errors and move on.
-        candidates = artwork_candidates_for_rom(rom)
-
-        shown = False
-        for u in candidates:
-            try:
-                st.image(u, use_container_width=True)
-                shown = True
-                break
-            except Exception:
-                continue
-
-        if not shown:
-            st.caption("No artwork found for this ROM in the Libretro MAME thumbnail set.")
-    else:
+    # Artwork
+    st.markdown("**Artwork (marquee → flyer → title → snap):**")
+    if not rom:
         st.caption("Artwork requires a `rom` column (MAME short name) in your CSV.")
+        return
+
+    found_url, kind = find_best_artwork(rom)
+    show_artwork_status(kind)
+
+    if found_url:
+        st.image(found_url, use_container_width=True)
+    else:
+        st.caption("Tip: Some games simply don't have artwork in the public set, or the ROM name differs (clone/parent).")
 
 
 # ----------------------------
@@ -237,7 +265,7 @@ if st.sidebar.button("🗑️ Clear Favorites"):
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Artwork source is hard-coded to Libretro thumbnails (MAME).")
+st.sidebar.caption("Artwork source (hard-coded): Libretro mame2003-plus thumbnail sources")
 
 # ----------------------------
 # Filters
@@ -284,15 +312,12 @@ else:
 st.header("Discover")
 
 btn1, btn2 = st.columns(2)
-
 with btn1:
     pick_random = st.button("🎲 Pick a Random Game")
-
 with btn2:
     if st.button("📜 Show/Hide List"):
         st.session_state.show_list = not st.session_state.show_list
 
-# Random pick (true random, but respects filters)
 if pick_random:
     if len(filtered) == 0:
         st.warning("No games match your filters. Try widening them.")
@@ -329,7 +354,6 @@ if st.session_state.show_list:
         st.info("No games to select. Widen filters or clear the search box.")
     else:
         view = view.reset_index(drop=True)
-
         labels = (
             view["game"].astype(str)
             + " — "
@@ -345,7 +369,6 @@ if st.session_state.show_list:
         if st.button("📌 Show selected game details"):
             show_game_details(selected_row, section_title="Selected Game")
 
-    # Download filtered list
     csv_bytes = view.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download this filtered list (CSV)",
