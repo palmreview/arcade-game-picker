@@ -3,6 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -20,16 +21,8 @@ st.caption(
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
 
-# Artwork source (public, no hosting required)
+# Public artwork source (no hosting required)
 ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
-
-# Priority order: marquee first → flyer → title → snap
-ART_SOURCES = [
-    ("Named_Boxarts-MARQUEES", "marquee"),
-    ("Named_Boxarts-FLYERS", "flyer"),
-    ("Named_Titles", "title"),
-    ("Named_Snaps", "snap"),
-]
 
 ART_TIMEOUT_SECS = 4
 
@@ -107,33 +100,84 @@ def toggle_favorite(key: str):
         st.session_state.favorites.append(key)
 
 
+# ----------------------------
+# Artwork: existence check + filename normalization + dual-key lookup
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def url_exists(url: str) -> bool:
+    """
+    More reliable than HEAD: do a tiny GET request using Range: bytes=0-0.
+    """
     try:
-        req = Request(url, method="HEAD")
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Range": "bytes=0-0",
+            },
+            method="GET",
+        )
         with urlopen(req, timeout=ART_TIMEOUT_SECS) as resp:
             return 200 <= resp.status < 400
     except (HTTPError, URLError, TimeoutError, ValueError):
         return False
 
 
-def find_best_artwork(rom: str):
-    if not rom:
-        return None, None
+def libretro_safe_filename(name: str) -> str:
+    """
+    Convert a game title into the filename style commonly used by Libretro thumbnails.
+    Replace forbidden filename characters with '_'. We'll URL-encode it later.
+    """
+    s = normalize_str(name)
+    for ch in ['\\', '/', ':', '*', '?', '"', '<', '>', '|']:
+        s = s.replace(ch, "_")
+    return s
 
+
+def find_best_artwork(rom: str, game_title: str):
+    """
+    Returns (found_url, kind, key_used) or (None, None, None)
+
+    Tries in priority order:
+      marquee → flyer → title → snap
+
+    For each, tries BOTH naming schemes:
+      A) ROM shortname (e.g., pacman.png) in rom-keyed folders
+      B) Game title (e.g., Pac-Man (Midway).png) in Named_* folders
+
+    NOTE: The public thumbnail sets vary: some are keyed by ROM, others by title.
+    """
     base = ART_BASE_URL.rstrip("/")
-    rom = rom.strip().lower()
 
-    for folder, kind in ART_SOURCES:
-        png = f"{base}/{folder}/{rom}.png"
-        if url_exists(png):
-            return png, kind
+    rom = normalize_str(rom).lower()
+    title = libretro_safe_filename(game_title)
+    # URL-encode but keep common readable characters
+    title_enc = quote(title, safe="()' -._")
 
-        jpg = f"{base}/{folder}/{rom}.jpg"
-        if url_exists(jpg):
-            return jpg, kind
+    # (rom-folder, title-folder, kind)
+    SOURCES = [
+        ("marquees", "Named_Boxarts-MARQUEES", "marquee"),
+        ("flyers",   "Named_Boxarts-FLYERS",   "flyer"),
+        ("titles",   "Named_Titles",           "title"),
+        ("snap",     "Named_Snaps",            "snap"),
+    ]
 
-    return None, None
+    for rom_folder, named_folder, kind in SOURCES:
+        # A) ROM-keyed lookup
+        if rom:
+            for ext in ("png", "jpg"):
+                u = f"{base}/{rom_folder}/{rom}.{ext}"
+                if url_exists(u):
+                    return u, kind, "rom"
+
+        # B) Title-keyed lookup
+        if title:
+            for ext in ("png", "jpg"):
+                u = f"{base}/{named_folder}/{title_enc}.{ext}"
+                if url_exists(u):
+                    return u, kind, "title"
+
+    return None, None, None
 
 
 def show_artwork_status(kind: str):
@@ -146,7 +190,7 @@ def show_artwork_status(kind: str):
     elif kind == "snap":
         st.info("➡️ Marquee/flyer/title not found — using gameplay snapshot fallback")
     else:
-        st.warning("⚠️ No artwork found in the public source for this ROM")
+        st.warning("⚠️ No artwork found in the public source for this game")
 
 
 def show_game_details(row: pd.Series, section_title: str = None):
@@ -189,18 +233,25 @@ def show_game_details(row: pd.Series, section_title: str = None):
         for name, url in links.items():
             st.write(f"- {name}: {url}")
 
+    # ----------------------------
+    # Artwork (dual-key): tries ROM and Title naming, with clear status + fallback
+    # ----------------------------
     st.markdown("**Artwork (marquee → flyer → title → snap):**")
-    if not rom:
-        st.caption("Artwork requires a `rom` column (MAME short name) in your CSV.")
-        return
 
-    found_url, kind = find_best_artwork(rom)
+    found_url, kind, key_used = find_best_artwork(rom, g)
     show_artwork_status(kind)
 
     if found_url:
+        if key_used == "rom":
+            st.caption("Artwork matched using ROM shortname.")
+        elif key_used == "title":
+            st.caption("Artwork matched using game title/description.")
         st.image(found_url, use_container_width=True)
     else:
-        st.caption("Tip: Some games don't have artwork in the public set, or the ROM name differs (clone/parent).")
+        st.caption(
+            "No artwork found. This can happen if artwork isn’t available for that title, "
+            "or if the image is stored under a parent/clone name."
+        )
 
 
 # ----------------------------
@@ -248,32 +299,15 @@ st.sidebar.markdown("---")
 st.sidebar.caption("Artwork source (hard-coded): Libretro mame2003-plus thumbnail sources")
 
 # ----------------------------
-# NEW: Search by Name (global)
+# Search by Name (global)
 # ----------------------------
 st.header("🔎 Search by Game Name")
 
 search_name = st.text_input("Type a game name (e.g., 'Out Run', 'Street Fighter', 'Pac-Man')", "")
 
-# Optional toggle: search within filtered results only (default: whole dataset)
-search_scope = st.radio("Search scope", ["Entire database", "Current filters only"], horizontal=True)
-
 if search_name.strip():
     s = search_name.strip().lower()
-
-    # We'll compute a temporary "scope df" depending on selection.
-    scope_df = df.copy()
-
-    if search_scope == "Current filters only":
-        # Apply same filters the user will set below (but we haven't built them yet)
-        # To keep it simple and consistent, we'll just search the entire db here.
-        # (You can change this later to truly use filters.)
-        pass
-
-    matches = scope_df[
-        scope_df["game"].astype(str).str.lower().str.contains(s)
-    ].copy()
-
-    # Keep it usable: limit to first 200 matches and sort
+    matches = df[df["game"].astype(str).str.lower().str.contains(s)].copy()
     matches = matches.sort_values(["year", "game"]).head(200).reset_index(drop=True)
 
     if len(matches) == 0:
@@ -286,9 +320,7 @@ if search_name.strip():
             + " — "
             + matches["company"].astype(str)
         )
-
         selected = st.selectbox("Matching games (select one)", labels, key="search_select")
-
         sel_idx = labels[labels == selected].index[0]
         sel_row = matches.loc[sel_idx]
 
