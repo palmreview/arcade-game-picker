@@ -1,0 +1,98 @@
+📦 Arcade Game Picker — Release Notes
+v1.3.0 — Game List Selection & Detail View
+
+Release Date: (add date)
+
+✨ New Features
+
+Added interactive game list based on active filters (year, genre, platform)
+
+Added search within filtered results for fast lookup
+
+Added game selection dropdown to choose a specific title from the list
+
+Added “Show selected game details” button to display:
+
+Game name
+
+Release year
+
+Company
+
+Genre
+
+Platform / hardware
+
+Quick links to gameplay videos, MAME info, and history
+
+Maintained existing Random Game Picker functionality
+
+📱 UX Improvements
+
+Tablet-friendly layout with clear sections
+
+List view and detail view work independently of random picker
+
+Clean separation between discovery (random) and exploration (list)
+
+v1.2.0 — Filtered Game List & Export
+
+Release Date: (add date)
+
+✨ New Features
+
+Added Show/Hide Game List button
+
+Displays all games matching current filters
+
+Added search box to refine visible results
+
+Added CSV download for filtered game lists
+
+🔧 Improvements
+
+Improved performance with cached CSV loading
+
+Better sorting by year and title
+
+Clear count of matching games
+
+v1.1.0 — Advanced Filtering
+
+Release Date: (add date)
+
+✨ New Features
+
+Added year range slider
+
+Added platform filter
+
+Added genre filter
+
+Live count of available games based on filters
+
+🔧 Improvements
+
+Improved data validation on load
+
+Cleaner handling of missing metadata
+
+v1.0.0 — Initial Release
+
+Release Date: (add date)
+
+🎉 Features
+
+Random arcade game picker (1978–2008)
+
+Displays basic game metadata
+
+One-click links to:
+
+YouTube gameplay
+
+MAME search
+
+General history search
+
+Deployed via Streamlit Cloud for tablet and mobile use
