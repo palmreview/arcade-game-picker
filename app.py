@@ -22,7 +22,8 @@ st.caption(
 TZ = ZoneInfo("America/New_York")
 
 # Public artwork source (no hosting required)
-ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
+#ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
+ART_BASE_URL = "https://thumbnails.libretro.com/MAME"
 
 ART_TIMEOUT_SECS = 4
 
@@ -233,9 +234,7 @@ def show_game_details(row: pd.Series, section_title: str = None):
         for name, url in links.items():
             st.write(f"- {name}: {url}")
 
-    # ----------------------------
-    # Artwork (dual-key): tries ROM and Title naming, with clear status + fallback
-    # ----------------------------
+    # --- Artwork (FIXED): ROM + Title lookup with clear fallback status ---
     st.markdown("**Artwork (marquee → flyer → title → snap):**")
 
     found_url, kind, key_used = find_best_artwork(rom, g)
@@ -243,15 +242,16 @@ def show_game_details(row: pd.Series, section_title: str = None):
 
     if found_url:
         if key_used == "rom":
-            st.caption("Artwork matched using ROM shortname.")
+            st.caption("Artwork matched using **ROM shortname**.")
         elif key_used == "title":
-            st.caption("Artwork matched using game title/description.")
+            st.caption("Artwork matched using **game title/description**.")
         st.image(found_url, use_container_width=True)
     else:
         st.caption(
-            "No artwork found. This can happen if artwork isn’t available for that title, "
-            "or if the image is stored under a parent/clone name."
+            "No artwork found in the public sets for this entry. "
+            "This can happen if artwork is only available under a parent ROM name or a different title variant."
         )
+
 
 
 # ----------------------------
