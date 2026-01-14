@@ -4,7 +4,7 @@ import pandas as pd
 st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 
 st.title("🕹️ Arcade Game Picker (1978–2008)")
-st.caption("Filter, pick a random game, or list all matching games.")
+st.caption("Filter, pick a random game, or list all matching games and select one for details.")
 
 @st.cache_data
 def load_games():
@@ -13,10 +13,16 @@ def load_games():
     df = df.dropna(subset=["game", "year"]).copy()
     df["year"] = df["year"].astype(int)
 
-    # Optional: ensure columns exist
+    # Ensure expected columns exist
     for col in ["company", "genre", "platform"]:
         if col not in df.columns:
             df[col] = ""
+
+    # Basic cleanup
+    df["game"] = df["game"].astype(str).str.strip()
+    df["company"] = df["company"].astype(str).str.strip()
+    df["genre"] = df["genre"].astype(str).str.strip()
+    df["platform"] = df["platform"].astype(str).str.strip()
 
     return df
 
@@ -27,8 +33,8 @@ df = load_games()
 # ----------------------------
 years = st.slider("Year range", 1978, 2008, (1978, 2008))
 
-platforms = sorted(df["platform"].dropna().astype(str).unique().tolist())
-genres = sorted(df["genre"].dropna().astype(str).unique().tolist())
+platforms = sorted(df["platform"].dropna().replace("", pd.NA).dropna().unique().tolist())
+genres = sorted(df["genre"].dropna().replace("", pd.NA).dropna().unique().tolist())
 
 col1, col2 = st.columns(2)
 with col1:
@@ -54,7 +60,6 @@ with btn1:
     pick_random = st.button("🎲 Pick a Random Game")
 
 with btn2:
-    # Toggle show/hide list using session_state
     if "show_list" not in st.session_state:
         st.session_state.show_list = False
 
@@ -90,12 +95,11 @@ if pick_random:
         st.markdown(f"📖 **History:** https://www.google.com/search?q={q}+arcade+history")
 
 # ----------------------------
-# List all matching games
+# List + Select for details
 # ----------------------------
 if st.session_state.show_list:
     st.subheader("📜 Matching Games")
 
-    # Optional: quick text filter within the filtered results
     search = st.text_input("Search within results (optional)", "")
 
     view = filtered[["game", "year", "company", "genre", "platform"]].copy()
@@ -111,7 +115,50 @@ if st.session_state.show_list:
         ]
 
     st.write(f"Showing: **{len(view):,}** games")
-    st.dataframe(view, use_container_width=True, height=500)
+    st.dataframe(view, use_container_width=True, height=450)
+
+    st.divider()
+    st.subheader("🔎 Select a game from the list to see details")
+
+    if len(view) == 0:
+        st.info("No games to select. Widen filters or clear the search box.")
+    else:
+        view = view.reset_index(drop=True)
+
+        labels = (
+            view["game"].astype(str)
+            + " — "
+            + view["year"].astype(str)
+            + " — "
+            + view["company"].astype(str)
+        )
+
+        selected_label = st.selectbox("Select a game", labels)
+
+        # Find the selected row
+        selected_idx = labels[labels == selected_label].index[0]
+        selected_row = view.loc[selected_idx]
+
+        if st.button("📌 Show selected game details"):
+            game = str(selected_row["game"])
+            year = int(selected_row["year"])
+            company = str(selected_row.get("company", ""))
+            genre = str(selected_row.get("genre", ""))
+            platform = str(selected_row.get("platform", ""))
+
+            st.subheader(game)
+            st.write(f"**Year:** {year}")
+            if company:
+                st.write(f"**Company:** {company}")
+            if genre:
+                st.write(f"**Genre:** {genre}")
+            if platform:
+                st.write(f"**Platform:** {platform}")
+
+            q = game.replace(" ", "+")
+            st.markdown(f"▶ **Gameplay:** https://www.youtube.com/results?search_query={q}+arcade")
+            st.markdown(f"🕹️ **MAME info:** https://www.google.com/search?q={q}+MAME")
+            st.markdown(f"📖 **History:** https://www.google.com/search?q={q}+arcade+history")
 
     # Download the filtered list
     csv_bytes = view.to_csv(index=False).encode("utf-8")
