@@ -22,7 +22,6 @@ st.caption(
 TZ = ZoneInfo("America/New_York")
 
 # Public artwork source (no hosting required)
-#ART_BASE_URL = "https://raw.githubusercontent.com/libretro-thumbnails/mame2003-plus-thumbnail-sources/master"
 ART_BASE_URL = "https://thumbnails.libretro.com/MAME"
 
 ART_TIMEOUT_SECS = 4
