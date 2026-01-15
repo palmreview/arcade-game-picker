@@ -1,9 +1,11 @@
 import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
 st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 
 st.title("🕹️ Arcade Game Picker (1978–2008)")
@@ -16,6 +18,11 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
+APP_VERSION = "1.4 (stable baseline) + server-side favorites"
+
+# Favorites directory (server-side JSON)
+FAV_DIR = Path(".favorites")
+FAV_DIR.mkdir(exist_ok=True)
 
 
 # ----------------------------
@@ -64,6 +71,42 @@ def init_state():
         st.session_state.show_list = False
     if "favorites" not in st.session_state:
         st.session_state.favorites = []
+    if "device_name" not in st.session_state:
+        st.session_state.device_name = "default"
+    if "favorites_loaded_for_device" not in st.session_state:
+        st.session_state.favorites_loaded_for_device = None  # tracks which device is loaded
+
+
+def safe_device_name(device_name: str) -> str:
+    # keep simple filesystem-safe chars
+    s = (device_name or "").strip()
+    s = "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_")).strip()
+    return s if s else "default"
+
+
+def favorites_path(device_name: str) -> Path:
+    safe = safe_device_name(device_name)
+    return FAV_DIR / f"favorites_{safe}.json"
+
+
+def load_favorites_from_disk(device_name: str) -> list[str]:
+    p = favorites_path(device_name)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        favs = data.get("favorites", [])
+        if isinstance(favs, list):
+            return [str(x) for x in favs]
+        return []
+    except Exception:
+        return []
+
+
+def save_favorites_to_disk(device_name: str, favorites: list[str]) -> None:
+    p = favorites_path(device_name)
+    payload = {"favorites": favorites}
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def game_key(row: pd.Series) -> str:
@@ -82,6 +125,9 @@ def toggle_favorite(key: str):
         st.session_state.favorites.remove(key)
     else:
         st.session_state.favorites.append(key)
+
+    # Auto-save after any favorite change
+    save_favorites_to_disk(st.session_state.device_name, st.session_state.favorites)
 
 
 def show_game_details(row: pd.Series, section_title: str = None):
@@ -133,45 +179,47 @@ init_state()
 df = load_games()
 
 # ----------------------------
-# Sidebar: Favorites import/export (per-device via download/upload)
+# Sidebar: Persistent Favorites (Server-side JSON)
 # ----------------------------
-st.sidebar.header("⭐ Favorites (Per Device)")
+st.sidebar.header("⭐ Favorites (Persistent)")
+st.sidebar.caption(f"Version {APP_VERSION}")
 
-fav_count = len(st.session_state.favorites)
-st.sidebar.write(f"Favorites in this session: **{fav_count}**")
-
-fav_json = json.dumps({"favorites": st.session_state.favorites}, indent=2).encode("utf-8")
-st.sidebar.download_button(
-    "⬇️ Download Favorites (JSON)",
-    data=fav_json,
-    file_name="arcade_favorites.json",
-    mime="application/json",
+device_input = st.sidebar.text_input(
+    "Device name (separate favorites per device)",
+    value=st.session_state.device_name,
+    help="Example: andrew-ipad, andrew-laptop. Only letters/numbers/-/_ are kept.",
 )
 
-uploaded = st.sidebar.file_uploader("⬆️ Import Favorites (JSON)", type=["json"])
-if uploaded is not None:
-    try:
-        data = json.loads(uploaded.read().decode("utf-8"))
-        favs = data.get("favorites", [])
-        if isinstance(favs, list):
-            st.session_state.favorites = list(dict.fromkeys([str(x) for x in favs]))
-            st.sidebar.success("Favorites imported!")
-            st.rerun()
-        else:
-            st.sidebar.error("Invalid favorites format.")
-    except Exception:
-        st.sidebar.error("Could not read that JSON file.")
+device = safe_device_name(device_input)
+st.session_state.device_name = device
 
-if st.sidebar.button("🗑️ Clear Favorites"):
-    st.session_state.favorites = []
-    st.sidebar.success("Favorites cleared.")
-    st.rerun()
+# Load favorites whenever the device changes OR on first run
+if st.session_state.favorites_loaded_for_device != device:
+    st.session_state.favorites = load_favorites_from_disk(device)
+    st.session_state.favorites_loaded_for_device = device
+
+st.sidebar.write(f"Device: **{device}**")
+st.sidebar.write(f"Favorites saved: **{len(st.session_state.favorites)}**")
+
+col_s1, col_s2 = st.sidebar.columns(2)
+with col_s1:
+    if st.sidebar.button("💾 Save now"):
+        save_favorites_to_disk(device, st.session_state.favorites)
+        st.sidebar.success("Saved!")
+with col_s2:
+    if st.sidebar.button("🗑️ Clear"):
+        st.session_state.favorites = []
+        save_favorites_to_disk(device, st.session_state.favorites)
+        st.sidebar.success("Cleared!")
+        st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Favorites are stored server-side in .favorites/*.json (no uploads).")
 
 # ----------------------------
 # Search by Name (global)
 # ----------------------------
 st.header("🔎 Search by Game Name")
-
 search_name = st.text_input("Type a game name (e.g., 'Out Run', 'Street Fighter', 'Pac-Man')", "")
 
 if search_name.strip():
@@ -224,14 +272,12 @@ filtered = filtered.sort_values(["year", "game"]).reset_index(drop=True)
 st.write(f"Games available: **{len(filtered):,}**")
 
 # ----------------------------
-# Game of the Day (FIXED)
+# Game of the Day (stable daily change)
 # ----------------------------
 st.header("📆 Game of the Day")
 
-# FIX: Use local date (America/New_York) and incorporate day-of-year + year
-# to avoid edge cases where a cached value or time zone mismatch keeps it unchanged.
 now = datetime.now(TZ)
-seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))  # e.g., 2026*1000 + day_of_year
+seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))  # year + day-of-year
 
 if len(filtered) == 0:
     st.warning("No games match your filters. Widen them to get a Game of the Day.")
@@ -324,6 +370,7 @@ else:
     fav_rows = []
     fav_set = set(st.session_state.favorites)
 
+    # Match favorites back to dataset
     for _, row in df.iterrows():
         k = game_key(row)
         if k in fav_set:
@@ -335,11 +382,3 @@ else:
         fav_df = pd.DataFrame(fav_rows)
         fav_df = fav_df[["rom", "game", "year", "company", "genre", "platform"]].sort_values(["year", "game"])
         st.dataframe(fav_df, use_container_width=True, height=320)
-
-        fav_csv = fav_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download Favorites (CSV)",
-            data=fav_csv,
-            file_name="arcade_favorites.csv",
-            mime="text/csv",
-        )
