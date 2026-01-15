@@ -11,14 +11,16 @@ st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Filter, pick random, list results, favorite games, search by name, and see a Game of the Day. "
-    "Artwork is temporarily disabled."
+    "Artwork is temporarily disabled. (Caching disabled so CSV updates take effect immediately.)"
 )
 
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.4 (stable baseline) + server-side favorites"
+APP_VERSION = "1.4 (stable baseline) + server-side favorites + no caching"
+
+CSV_PATH = "arcade_games_1978_2008_clean.csv"
 
 # Favorites directory (server-side JSON)
 FAV_DIR = Path(".favorites")
@@ -51,9 +53,8 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
-def load_games():
-    df = pd.read_csv("arcade_games_1978_2008_clean.csv")
+def load_games_no_cache() -> pd.DataFrame:
+    df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
 
 
@@ -78,7 +79,6 @@ def init_state():
 
 
 def safe_device_name(device_name: str) -> str:
-    # keep simple filesystem-safe chars
     s = (device_name or "").strip()
     s = "".join(ch for ch in s if ch.isalnum() or ch in ("-", "_")).strip()
     return s if s else "default"
@@ -176,13 +176,21 @@ def show_game_details(row: pd.Series, section_title: str = None):
 # App state + data
 # ----------------------------
 init_state()
-df = load_games()
+df = load_games_no_cache()
 
 # ----------------------------
 # Sidebar: Persistent Favorites (Server-side JSON)
 # ----------------------------
 st.sidebar.header("⭐ Favorites (Persistent)")
 st.sidebar.caption(f"Version {APP_VERSION}")
+
+# CSV debug info (helps confirm you're using the latest file)
+try:
+    p = Path(CSV_PATH)
+    st.sidebar.caption(f"CSV rows: {len(df):,}")
+    st.sidebar.caption(f"CSV modified (server): {datetime.fromtimestamp(p.stat().st_mtime)}")
+except Exception:
+    st.sidebar.caption("CSV info: unavailable")
 
 device_input = st.sidebar.text_input(
     "Device name (separate favorites per device)",
@@ -370,7 +378,6 @@ else:
     fav_rows = []
     fav_set = set(st.session_state.favorites)
 
-    # Match favorites back to dataset
     for _, row in df.iterrows():
         k = game_key(row)
         if k in fav_set:
