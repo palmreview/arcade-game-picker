@@ -4,7 +4,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-st.sidebar.caption("Version 1.4 (stable baseline)")
 st.set_page_config(page_title="Arcade Game Picker", layout="centered")
 
 st.title("🕹️ Arcade Game Picker (1978–2008)")
