@@ -3,7 +3,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -26,10 +26,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = (
-    "1.7 (baseline candidate) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • "
-    "ADB description inline • Curated links (Arcade-Museum + ADB) • No caching"
-)
+APP_VERSION = "1.7 (baseline candidate) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -47,8 +44,8 @@ STATUS_LABELS = {
 # DB (global state across devices)
 # ----------------------------
 def get_db() -> sqlite3.Connection:
+    # check_same_thread False is fine for Streamlit single-process usage
     return sqlite3.connect(DB_PATH, check_same_thread=False)
-
 
 def init_db() -> None:
     conn = get_db()
@@ -64,8 +61,10 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
-
 def get_all_statuses() -> dict[str, str]:
+    """
+    Returns mapping: rom -> status
+    """
     conn = get_db()
     cur = conn.execute("SELECT rom, status FROM game_status")
     rows = cur.fetchall()
@@ -76,6 +75,15 @@ def get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
+def get_status(rom: str) -> str | None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return None
+    conn = get_db()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
@@ -98,7 +106,6 @@ def set_status(rom: str, status: str | None) -> None:
     conn.commit()
     conn.close()
 
-
 # ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
@@ -106,7 +113,6 @@ def normalize_str(x) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
-
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["rom", "game", "year", "company", "genre", "platform"]:
@@ -123,7 +129,6 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["game", "year"]).copy()
     df["year"] = df["year"].astype(int)
 
-    # lowercase helper cols
     df["_game_l"] = df["game"].astype(str).str.lower()
     df["_genre_l"] = df["genre"].astype(str).str.lower()
     df["_platform_l"] = df["platform"].astype(str).str.lower()
@@ -131,22 +136,25 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
 
+def build_links(game_name: str):
+    q = game_name.replace(" ", "+")
+    return {
+        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
+        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
+        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
+        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
+        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
+    }
 
 def game_key(row: pd.Series) -> str:
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
-    return (
-        f"meta:{normalize_str(row.get('game',''))}|"
-        f"{int(row.get('year',0))}|"
-        f"{normalize_str(row.get('company',''))}"
-    )
-
+    return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
 
 def init_state():
     if "picked_rows" not in st.session_state:
@@ -159,28 +167,6 @@ def init_state():
         st.session_state.status_cache = {}
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
-
-
-# ----------------------------
-# Curated links (Arcade-Museum + ADB only)
-# ----------------------------
-def build_curated_links(game_name: str, rom: str | None) -> dict[str, str]:
-    """
-    Curated sources:
-      - Arcade-Museum / Museum of the Game (KLOV) search
-      - Arcade-Museum MAME database page (for ROM-centric browsing)
-      - ADB page (ROM-based)
-    """
-    q_title = quote_plus(game_name.strip())
-    links = {
-        "Arcade-Museum (Museum of the Game / KLOV) — Search": f"https://www.arcade-museum.com/search?term={q_title}",
-        "Arcade-Museum — MAME Database": "https://www.arcade-museum.com/tech-center/mame",
-    }
-    if rom:
-        r = rom.strip().lower()
-        links["ADB (Arcade Database / ArcadeItalia) — ROM page"] = f"https://adb.arcadeitalia.net/?mame={r}"
-    return links
-
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -219,7 +205,6 @@ BLOCKED_TITLE_HINTS = [
     "paddle",
 ]
 
-
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -244,11 +229,10 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 
     return True
 
-
 # ----------------------------
-# ADB (ArcadeItalia) integration (on-demand + inline description)
+# ADB (ArcadeItalia) on-demand integration
 # ----------------------------
-def adb_urls(rom: str) -> dict[str, str]:
+def adb_urls(rom: str):
     rom = (rom or "").strip().lower()
     page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
     page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
@@ -262,7 +246,6 @@ def adb_urls(rom: str) -> dict[str, str]:
         "scraper_https": scraper_https,
         "scraper_http": scraper_http,
     }
-
 
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
@@ -279,7 +262,6 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     if isinstance(data, dict):
         return data
     return {"_data": data}
-
 
 def fetch_adb_details(rom: str) -> dict:
     rom = (rom or "").strip().lower()
@@ -308,9 +290,8 @@ def fetch_adb_details(rom: str) -> dict:
     st.session_state.adb_cache[rom] = out
     return out
 
-
 def extract_image_urls(obj) -> list[str]:
-    urls: list[str] = []
+    urls = []
 
     def walk(x):
         if isinstance(x, dict):
@@ -334,7 +315,6 @@ def extract_image_urls(obj) -> list[str]:
             seen.add(u)
             out.append(u)
     return out
-
 
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
@@ -394,15 +374,13 @@ def show_adb_block(rom: str):
 
     return data
 
-
 # ----------------------------
-# Status caching
+# Status UI + caching
 # ----------------------------
 def load_status_cache_once():
     if not st.session_state.status_cache_loaded:
         st.session_state.status_cache = get_all_statuses()
         st.session_state.status_cache_loaded = True
-
 
 def status_for_rom(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
@@ -410,17 +388,16 @@ def status_for_rom(rom: str) -> str | None:
         return None
     return st.session_state.status_cache.get(rom)
 
-
 def update_status(rom: str, new_status: str | None):
     rom = (rom or "").strip().lower()
     if not rom:
         return
     set_status(rom, new_status)
+    # Update in-memory cache immediately
     if new_status is None:
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
-
 
 # ----------------------------
 # Details panel
@@ -433,8 +410,8 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
+    # Status controls
     cur_status = status_for_rom(rom)
-
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
@@ -463,35 +440,13 @@ def show_game_details(row: pd.Series):
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    # --- Inline ADB description ABOVE links ---
-    adb_desc = None
-    if rom:
-        adb = st.session_state.adb_cache.get(rom)
-        if adb is None:
-            try:
-                adb = fetch_adb_details(rom)
-            except Exception:
-                adb = None
-
-        if isinstance(adb, dict) and adb and not adb.get("_error"):
-            desc = adb.get("description")
-            if isinstance(desc, str) and desc.strip():
-                desc = re.sub(r"\s+", " ", desc).strip()
-                adb_desc = desc
-
-    if adb_desc:
-        st.markdown("### 📝 Description")
-        st.write(adb_desc)
-
-    # --- Curated links ONLY ---
-    st.markdown("### 🏛️ Curated sources")
-    for name, url in build_curated_links(g, rom).items():
+    st.markdown("### 🔗 Research links")
+    for name, url in build_links(g).items():
         st.write(f"- {name}: {url}")
 
     st.markdown("---")
     st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
     show_adb_block(rom)
-
 
 # ----------------------------
 # Boot app
@@ -499,6 +454,7 @@ def show_game_details(row: pd.Series):
 init_state()
 init_db()
 
+# Load dataset (no caching)
 try:
     df = load_games_no_cache()
 except FileNotFoundError:
@@ -509,10 +465,11 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
+# Load status cache once per session (global data)
 load_status_cache_once()
 
 # ----------------------------
-# Sidebar
+# Sidebar: Cabinet mode + status filtering
 # ----------------------------
 st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
@@ -521,6 +478,7 @@ strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", valu
 
 st.sidebar.markdown("---")
 st.sidebar.header("✅ Status filters")
+
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
@@ -555,7 +513,7 @@ if genre_choice:
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
-
+# Apply status filters
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
@@ -564,7 +522,6 @@ def keep_by_status(row: pd.Series) -> bool:
     if hide_played and s == STATUS_PLAYED:
         return False
     return True
-
 
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
@@ -641,6 +598,7 @@ with left:
     st.markdown("---")
     st.markdown("## 📜 Browse list")
 
+    # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
     view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
@@ -695,6 +653,7 @@ with right:
             else:
                 show_game_details(match.iloc[0])
         else:
+            # meta fallback (rare)
             try:
                 _, meta = key.split("meta:", 1)
                 title, year_str, company = meta.split("|", 2)
