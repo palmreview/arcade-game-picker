@@ -15,7 +15,7 @@ import streamlit as st
 # ----------------------------
 st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 
-st.title(" Arcade Game Picker (19782008)")
+st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
     "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
@@ -26,7 +26,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7 (baseline candidate)  Strict Cabinet Mode  ADB on-demand  Global status via SQLite  No caching"
+APP_VERSION = "1.7 (baseline candidate) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -35,9 +35,9 @@ STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
 
 STATUS_LABELS = {
-    None: "",
-    STATUS_WANT: " Want to Play",
-    STATUS_PLAYED: " Played",
+    None: "—",
+    STATUS_WANT: "⏳ Want to Play",
+    STATUS_PLAYED: "✅ Played",
 }
 
 # ----------------------------
@@ -49,7 +49,6 @@ def get_db() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = get_db()
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS game_status (
@@ -59,34 +58,8 @@ def init_db() -> None:
         )
         """
     )
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pick_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            pick_key TEXT NOT NULL,
-            picked_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pick_history_kind_time ON pick_history(kind, picked_at)")
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS gotd_daily (
-            day TEXT NOT NULL,
-            filter_sig TEXT NOT NULL,
-            pick_key TEXT NOT NULL,
-            created_at TEXT DEFAULT (datetime('now')),
-            PRIMARY KEY (day, filter_sig)
-        )
-        """
-    )
-
     conn.commit()
     conn.close()
-
 
 def get_all_statuses() -> dict[str, str]:
     """
@@ -134,80 +107,6 @@ def set_status(rom: str, status: str | None) -> None:
     conn.close()
 
 # ----------------------------
-# DB helpers: avoid repeats (Random / GOTD)
-# ----------------------------
-
-def record_pick(kind: str, pick_key: str) -> None:
-    if not pick_key:
-        return
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO pick_history(kind, pick_key, picked_at) VALUES(?, ?, datetime('now'))",
-        (kind, pick_key),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_recent_pick_keys(kind: str, limit: int = 14) -> set[str]:
-    conn = get_db()
-    cur = conn.execute(
-        "SELECT pick_key FROM pick_history WHERE kind=? ORDER BY picked_at DESC, id DESC LIMIT ?",
-        (kind, int(limit)),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return {r[0] for r in rows if r and r[0]}
-
-
-def get_recent_picks(kind: str, limit: int = 5) -> list[dict[str, str]]:
-    """Return recent picks for debug display.
-
-    Each row contains: pick_key, picked_at (SQLite datetime text).
-    """
-    conn = get_db()
-    cur = conn.execute(
-        "SELECT pick_key, picked_at FROM pick_history WHERE kind=? ORDER BY picked_at DESC, id DESC LIMIT ?",
-        (kind, int(limit)),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    out: list[dict[str, str]] = []
-    for pk, ts in rows:
-        out.append({"pick_key": str(pk), "picked_at": str(ts)})
-    return out
-
-
-def get_gotd_pick_key(day: str, filter_sig: str) -> str | None:
-    conn = get_db()
-    cur = conn.execute(
-        "SELECT pick_key FROM gotd_daily WHERE day=? AND filter_sig=?",
-        (day, filter_sig),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def set_gotd_pick_key(day: str, filter_sig: str, pick_key: str) -> None:
-    if not pick_key:
-        return
-    conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO gotd_daily(day, filter_sig, pick_key, created_at)
-        VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(day, filter_sig) DO UPDATE SET
-            pick_key=excluded.pick_key,
-            created_at=datetime('now')
-        """,
-        (day, filter_sig, pick_key),
-    )
-    conn.commit()
-    conn.close()
-
-
-# ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
 def normalize_str(x) -> str:
@@ -235,71 +134,23 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["_platform_l"] = df["platform"].astype(str).str.lower()
     df["_company_l"] = df["company"].astype(str).str.lower()
 
-    # Stable selection key (used for repeat-avoid logic)
-    df["_key"] = df["rom"].astype(str).str.strip().str.lower().map(lambda r: f"rom:{r}" if r else "")
-    missing = df["_key"] == ""
-    if missing.any():
-        df.loc[missing, "_key"] = (
-            "meta:"
-            + df.loc[missing, "game"].astype(str)
-            + "|"
-            + df.loc[missing, "year"].astype(str)
-            + "|"
-            + df.loc[missing, "company"].astype(str)
-        )
-    df["_key_l"] = df["_key"].astype(str).str.lower()
-
     return df
 
 def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
 
-def build_curated_links(game_name: str, rom: str | None = None) -> dict[str, list[tuple[str, str]]]:
-    """Curated, cabinet-first sources (no random Google searches).
-
-    Returns a mapping of "intent" -> list of (label, url).
-    """
-
-    q = (game_name or "").strip().replace(" ", "+")
-    rom = (rom or "").strip().lower()
-
-    links: dict[str, list[tuple[str, str]]] = {
-        "Gameplay": [
-            ("YouTube gameplay search", f"https://www.youtube.com/results?search_query={q}+arcade+gameplay"),
-        ],
-        "History / legacy": [
-            (
-                "Arcade-Museum encyclopedia search",
-                # Arcade-Museum blocks some automated fetching, but a direct link is still useful to users.
-                "https://www.arcade-museum.com/search",
-            ),
-        ],
-        "Controls / instructions": [
-            (
-                "Arcade-Museum encyclopedia search",
-                "https://www.arcade-museum.com/search",
-            ),
-        ],
-        "Ports / collections": [
-            ("YouTube ports/collections search", f"https://www.youtube.com/results?search_query={q}+arcade+collection+port"),
-        ],
+def build_links(game_name: str):
+    q = game_name.replace(" ", "+")
+    return {
+        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
+        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
+        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
+        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
+        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
     }
 
-    # Add ADB links when ROM is available
-    if rom:
-        links.setdefault("Quick refs", []).extend(
-            [
-                ("ADB (ArcadeItalia) page", f"https://adb.arcadeitalia.net/?mame={rom}"),
-            ]
-        )
-
-    return links
-
 def game_key(row: pd.Series) -> str:
-    k = normalize_str(row.get("_key", "")).strip()
-    if k:
-        return k
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
@@ -478,9 +329,9 @@ def show_adb_block(rom: str):
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
-        load_btn = st.button(" Load ADB details", key=f"adb_load_{rom}")
+        load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
     with c2:
-        refresh_btn = st.button(" Refresh", key=f"adb_refresh_{rom}")
+        refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
     with c3:
         show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
 
@@ -562,56 +413,40 @@ def show_game_details(row: pd.Series):
     # Status controls
     cur_status = status_for_rom(rom)
     st.markdown(f"## {g}")
-    st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '')}")
+    st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
     s1, s2, s3 = st.columns([1, 1, 1])
     with s1:
-        if st.button(" Want to Play", use_container_width=True, key=f"st_want_{rom}"):
+        if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
             st.rerun()
     with s2:
-        if st.button(" Played", use_container_width=True, key=f"st_played_{rom}"):
+        if st.button("✅ Played", use_container_width=True, key=f"st_played_{rom}"):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
     with s3:
-        if st.button(" Clear", use_container_width=True, key=f"st_clear_{rom}"):
+        if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
 
-    # --- Streamlined details (expanders) ---
-    with st.expander("Quick info", expanded=True):
-        st.write(f"**Year:** {y}")
-        if c:
-            st.write(f"**Company:** {c}")
-        if genre:
-            st.write(f"**Genre:** {genre}")
-        if platform:
-            st.write(f"**Platform:** {platform}")
-        if rom:
-            st.write(f"**ROM (MAME short name):** `{rom}`")
+    st.write(f"**Year:** {y}")
+    if c:
+        st.write(f"**Company:** {c}")
+    if genre:
+        st.write(f"**Genre:** {genre}")
+    if platform:
+        st.write(f"**Platform:** {platform}")
+    if rom:
+        st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    with st.expander("Learn / research (curated)", expanded=False):
-        intents = build_curated_links(g, rom)
-        intent_names = list(intents.keys())
+    st.markdown("### 🔗 Research links")
+    for name, url in build_links(g).items():
+        st.write(f"- {name}: {url}")
 
-        # Default to something useful without being noisy
-        default_intent = "History / legacy" if "History / legacy" in intents else intent_names[0]
-        intent = st.selectbox(
-            "What do you want right now?",
-            intent_names,
-            index=intent_names.index(default_intent),
-            key=f"learn_intent_{rom or g}",
-        )
-        for label, url in intents.get(intent, []):
-            st.write(f"- {label}: {url}")
-
-        # Small note: Arcade-Museum has a strong encyclopedia, but its search UX varies.
-        if intent in ("History / legacy", "Controls / instructions"):
-            st.caption("Tip: use the search box on Arcade-Museum and paste the game title if needed.")
-
-    with st.expander("ADB details + artwork (on-demand)", expanded=False):
-        show_adb_block(rom)
+    st.markdown("---")
+    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
+    show_adb_block(rom)
 
 # ----------------------------
 # Boot app
@@ -636,43 +471,18 @@ load_status_cache_once()
 # ----------------------------
 # Sidebar: Cabinet mode + status filtering
 # ----------------------------
-st.sidebar.header(" Cabinet Mode")
+st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
 
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
 
 st.sidebar.markdown("---")
-st.sidebar.header(" Status filters")
+st.sidebar.header("✅ Status filters")
 
-hide_played = st.sidebar.toggle("Hide  Played", value=True)
-only_want = st.sidebar.toggle("Show only  Want to Play", value=False)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Discovery behavior")
-avoid_repeats = st.sidebar.toggle("Avoid recent repeats (Random / GOTD)", value=True)
-repeat_window = st.sidebar.slider("Repeat window (recent picks to avoid)", 0, 30, 14)
+hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
+only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
 st.sidebar.markdown("---")
-st.sidebar.header("Debug")
-show_debug = st.sidebar.toggle("Show recent picks", value=False)
-
-if show_debug:
-    with st.sidebar.expander("Recent picks (last 5)", expanded=True):
-        r = pd.DataFrame(get_recent_picks("random", 5))
-        g = pd.DataFrame(get_recent_picks("gotd", 5))
-
-        st.markdown("**Random**")
-        if len(r) == 0:
-            st.caption("No Random picks recorded yet.")
-        else:
-            st.dataframe(r, use_container_width=True, height=180)
-
-        st.markdown("**Game of the Day**")
-        if len(g) == 0:
-            st.caption("No GOTD opens recorded yet.")
-        else:
-            st.dataframe(g, use_container_width=True, height=180)
-
 st.sidebar.header("Filters")
 
 years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
@@ -719,7 +529,7 @@ base = base.sort_values(["year", "game"]).reset_index(drop=True)
 # ----------------------------
 # Search
 # ----------------------------
-st.markdown("##  Search")
+st.markdown("## 🔎 Search")
 search_name = st.text_input("Search by name or ROM (e.g., pacman, sf2, metal slug)", "")
 
 if search_name.strip():
@@ -735,20 +545,50 @@ st.write(f"Matches: **{len(hits):,}**")
 st.divider()
 
 # ----------------------------
+# Genre timeline (simple)
+# ----------------------------
+with st.expander("📈 Genre timeline (simple)", expanded=False):
+    st.caption("Counts reflect your current filters (strict mode, status filters, platform/genre filters, etc.).")
+    timeline_genres = sorted(base["genre"].replace("", pd.NA).dropna().unique().tolist())
+    if not timeline_genres:
+        st.info("No genres available with the current filters.")
+    else:
+        selected_timeline_genres = st.multiselect(
+            "Genres to plot",
+            timeline_genres,
+            default=[],
+            help="Pick one or more genres to see how many matching games appear per year.",
+        )
+
+        timeline_df = base.copy()
+        if selected_timeline_genres:
+            timeline_df = timeline_df[timeline_df["genre"].isin(selected_timeline_genres)]
+
+        if len(timeline_df) == 0:
+            st.info("No games match the selected timeline genres with the current filters.")
+        else:
+            counts = (
+                timeline_df.groupby("year")
+                .size()
+                .reindex(range(years[0], years[1] + 1), fill_value=0)
+            )
+            st.bar_chart(counts)
+
+# ----------------------------
 # Two-panel layout
 # ----------------------------
 left, right = st.columns([1.15, 1.0], gap="large")
 
 with left:
-    st.markdown("##  Discover (cabinet-ready)")
+    st.markdown("## 🎲 Discover (cabinet-ready)")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        pick_random = st.button(" Random", use_container_width=True)
+        pick_random = st.button("🎲 Random", use_container_width=True)
     with c2:
-        pick_10 = st.button(" 10 Picks", use_container_width=True)
+        pick_10 = st.button("🎯 10 Picks", use_container_width=True)
     with c3:
-        clear_sel = st.button(" Clear selection", use_container_width=True)
+        clear_sel = st.button("🧹 Clear selection", use_container_width=True)
 
     if clear_sel:
         st.session_state.picked_rows = []
@@ -759,17 +599,8 @@ with left:
         if len(hits) == 0:
             st.warning("No games match your current strict cabinet + status filters. Widen filters.")
         else:
-            candidates = hits
-            if avoid_repeats and repeat_window > 0:
-                recent = get_recent_pick_keys("random", repeat_window)
-                candidates = hits[~hits["_key"].isin(recent)]
-                if len(candidates) == 0:
-                    candidates = hits
-
-            row = candidates.sample(1).iloc[0]
-            key = game_key(row)
-            record_pick("random", key)
-            st.session_state.selected_key = key
+            row = hits.sample(1).iloc[0]
+            st.session_state.selected_key = game_key(row)
             st.rerun()
 
     if pick_10:
@@ -782,52 +613,24 @@ with left:
             st.session_state.selected_key = game_key(pd.Series(st.session_state.picked_rows[0]))
             st.rerun()
 
-    st.markdown("###  Game of the Day")
+    st.markdown("### 📆 Game of the Day")
     now = datetime.now(TZ)
-    day = now.strftime("%Y-%m-%d")
     seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-
-    # GOTD is stable per day + current filter settings, and avoids recent repeats
-    filter_sig = (
-        f"strict={int(strict_mode)}|years={years[0]}-{years[1]}|"
-        f"platform={','.join(platform_choice)}|genre={','.join(genre_choice)}|"
-        f"hide_played={int(hide_played)}|only_want={int(only_want)}|"
-        f"avoid={int(avoid_repeats)}|win={int(repeat_window)}"
-    )
-
     if len(hits) > 0:
-        stored_key = get_gotd_pick_key(day, filter_sig)
-        keys_in_hits = set(hits["_key"].astype(str).tolist())
-
-        if stored_key and stored_key in keys_in_hits:
-            gotd = hits[hits["_key"] == stored_key].iloc[0]
-            gotd_key = stored_key
-        else:
-            candidates = hits
-            if avoid_repeats and repeat_window > 0:
-                recent = get_recent_pick_keys("gotd", repeat_window)
-                candidates = hits[~hits["_key"].isin(recent)]
-                if len(candidates) == 0:
-                    candidates = hits
-
-            gotd = candidates.iloc[seed % len(candidates)]
-            gotd_key = game_key(gotd)
-            set_gotd_pick_key(day, filter_sig, gotd_key)
-
+        gotd = hits.iloc[seed % len(hits)]
         st.caption(f"Today: {gotd['game']} ({gotd['year']})")
         if st.button("Open Game of the Day", use_container_width=True):
-            record_pick("gotd", gotd_key)
-            st.session_state.selected_key = gotd_key
+            st.session_state.selected_key = game_key(gotd)
             st.rerun()
     else:
         st.caption("No Game of the Day with current filters.")
 
     st.markdown("---")
-    st.markdown("##  Browse list")
+    st.markdown("## 📜 Browse list")
 
     # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
-    view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), ""))
+    view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
     st.dataframe(view, use_container_width=True, height=420)
 
@@ -837,36 +640,36 @@ with left:
     else:
         labels = (
             view["game"].astype(str)
-            + "  "
+            + " — "
             + view["year"].astype(str)
-            + "  "
+            + " — "
             + view["company"].astype(str)
-            + "  "
+            + " — "
             + view["status"].astype(str)
         )
         selected_label = st.selectbox("Pick from results", labels, key="browse_select")
         idx = labels[labels == selected_label].index[0]
         selected_row = view.loc[idx]
 
-        if st.button(" Open selected", use_container_width=True):
+        if st.button("➡️ Open selected", use_container_width=True):
             st.session_state.selected_key = game_key(selected_row)
             st.rerun()
 
     if st.session_state.picked_rows:
         st.markdown("---")
-        st.markdown("##  Your 10 picks")
+        st.markdown("## 🎯 Your 10 picks")
         pick_df = pd.DataFrame(st.session_state.picked_rows)
         pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
-        pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), ""))
+        pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
         for i, r in pick_df.iterrows():
-            label = f"{r['game']} ({int(r['year'])})  {r['status']}"
+            label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
             if st.button(label, key=f"pick_{i}", use_container_width=True):
                 st.session_state.selected_key = game_key(r)
                 st.rerun()
 
 with right:
-    st.markdown("##  Details")
+    st.markdown("## 🧾 Details")
     if not st.session_state.selected_key:
         st.info("Pick a game from the list or hit Random/10 Picks to see details.")
     else:
