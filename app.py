@@ -49,6 +49,7 @@ def get_db() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = get_db()
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS game_status (
@@ -58,8 +59,34 @@ def init_db() -> None:
         )
         """
     )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pick_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            pick_key TEXT NOT NULL,
+            picked_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pick_history_kind_time ON pick_history(kind, picked_at)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gotd_daily (
+            day TEXT NOT NULL,
+            filter_sig TEXT NOT NULL,
+            pick_key TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (day, filter_sig)
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
+
 
 def get_all_statuses() -> dict[str, str]:
     """
@@ -107,6 +134,62 @@ def set_status(rom: str, status: str | None) -> None:
     conn.close()
 
 # ----------------------------
+# DB helpers: avoid repeats (Random / GOTD)
+# ----------------------------
+
+def record_pick(kind: str, pick_key: str) -> None:
+    if not pick_key:
+        return
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO pick_history(kind, pick_key, picked_at) VALUES(?, ?, datetime('now'))",
+        (kind, pick_key),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_pick_keys(kind: str, limit: int = 14) -> set[str]:
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT pick_key FROM pick_history WHERE kind=? ORDER BY picked_at DESC, id DESC LIMIT ?",
+        (kind, int(limit)),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return {r[0] for r in rows if r and r[0]}
+
+
+def get_gotd_pick_key(day: str, filter_sig: str) -> str | None:
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT pick_key FROM gotd_daily WHERE day=? AND filter_sig=?",
+        (day, filter_sig),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_gotd_pick_key(day: str, filter_sig: str, pick_key: str) -> None:
+    if not pick_key:
+        return
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO gotd_daily(day, filter_sig, pick_key, created_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(day, filter_sig) DO UPDATE SET
+            pick_key=excluded.pick_key,
+            created_at=datetime('now')
+        """,
+        (day, filter_sig, pick_key),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
 def normalize_str(x) -> str:
@@ -134,6 +217,20 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["_platform_l"] = df["platform"].astype(str).str.lower()
     df["_company_l"] = df["company"].astype(str).str.lower()
 
+    # Stable selection key (used for repeat-avoid logic)
+    df["_key"] = df["rom"].astype(str).str.strip().str.lower().map(lambda r: f"rom:{r}" if r else "")
+    missing = df["_key"] == ""
+    if missing.any():
+        df.loc[missing, "_key"] = (
+            "meta:"
+            + df.loc[missing, "game"].astype(str)
+            + "|"
+            + df.loc[missing, "year"].astype(str)
+            + "|"
+            + df.loc[missing, "company"].astype(str)
+        )
+    df["_key_l"] = df["_key"].astype(str).str.lower()
+
     return df
 
 def load_games_no_cache() -> pd.DataFrame:
@@ -151,6 +248,9 @@ def build_links(game_name: str):
     }
 
 def game_key(row: pd.Series) -> str:
+    k = normalize_str(row.get("_key", "")).strip()
+    if k:
+        return k
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
@@ -233,28 +333,18 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 # ADB (ArcadeItalia) on-demand integration
 # ----------------------------
 def adb_urls(rom: str):
-    """ADB (ArcadeItalia) endpoints.
-
-    Some users have reported the HTTPS *page* URL not resolving correctly in their environment.
-    To keep the UX reliable, the app prefers HTTP for the human-facing page link, while still
-    keeping HTTPS as an alternate.
-    """
     rom = (rom or "").strip().lower()
-
-    # Human-facing pages
-    page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
     page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
+    page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
 
-    # JSON scraper endpoints
     params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
-    scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
     scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
-
+    scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
     return {
-        "page_http": page_http,
         "page_https": page_https,
-        "scraper_http": scraper_http,
+        "page_http": page_http,
         "scraper_https": scraper_https,
+        "scraper_http": scraper_http,
     }
 
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
@@ -283,7 +373,7 @@ def fetch_adb_details(rom: str) -> dict:
 
     urls = adb_urls(rom)
     last_err = None
-    for u in (urls["scraper_http"], urls["scraper_https"]):
+    for u in (urls["scraper_https"], urls["scraper_http"]):
         try:
             data = fetch_json_url(u, timeout_sec=12)
             st.session_state.adb_cache[rom] = data
@@ -334,8 +424,8 @@ def show_adb_block(rom: str):
 
     urls = adb_urls(rom)
     st.markdown("**ADB links:**")
-    st.write(f"- ADB page (HTTP): {urls['page_http']}")
-    st.write(f"- ADB page (HTTPS alt): {urls['page_https']}")
+    st.write(f"- ADB page (HTTPS): {urls['page_https']}")
+    st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
@@ -493,6 +583,11 @@ hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
 st.sidebar.markdown("---")
+st.sidebar.header("Discovery behavior")
+avoid_repeats = st.sidebar.toggle("Avoid recent repeats (Random / GOTD)", value=True)
+repeat_window = st.sidebar.slider("Repeat window (recent picks to avoid)", 0, 30, 14)
+
+st.sidebar.markdown("---")
 st.sidebar.header("Filters")
 
 years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
@@ -579,8 +674,17 @@ with left:
         if len(hits) == 0:
             st.warning("No games match your current strict cabinet + status filters. Widen filters.")
         else:
-            row = hits.sample(1).iloc[0]
-            st.session_state.selected_key = game_key(row)
+            candidates = hits
+            if avoid_repeats and repeat_window > 0:
+                recent = get_recent_pick_keys("random", repeat_window)
+                candidates = hits[~hits["_key"].isin(recent)]
+                if len(candidates) == 0:
+                    candidates = hits
+
+            row = candidates.sample(1).iloc[0]
+            key = game_key(row)
+            record_pick("random", key)
+            st.session_state.selected_key = key
             st.rerun()
 
     if pick_10:
@@ -595,12 +699,40 @@ with left:
 
     st.markdown("### 📆 Game of the Day")
     now = datetime.now(TZ)
+    day = now.strftime("%Y-%m-%d")
     seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
+
+    # GOTD is stable per day + current filter settings, and avoids recent repeats
+    filter_sig = (
+        f"strict={int(strict_mode)}|years={years[0]}-{years[1]}|"
+        f"platform={','.join(platform_choice)}|genre={','.join(genre_choice)}|"
+        f"hide_played={int(hide_played)}|only_want={int(only_want)}|"
+        f"avoid={int(avoid_repeats)}|win={int(repeat_window)}"
+    )
+
     if len(hits) > 0:
-        gotd = hits.iloc[seed % len(hits)]
+        stored_key = get_gotd_pick_key(day, filter_sig)
+        keys_in_hits = set(hits["_key"].astype(str).tolist())
+
+        if stored_key and stored_key in keys_in_hits:
+            gotd = hits[hits["_key"] == stored_key].iloc[0]
+            gotd_key = stored_key
+        else:
+            candidates = hits
+            if avoid_repeats and repeat_window > 0:
+                recent = get_recent_pick_keys("gotd", repeat_window)
+                candidates = hits[~hits["_key"].isin(recent)]
+                if len(candidates) == 0:
+                    candidates = hits
+
+            gotd = candidates.iloc[seed % len(candidates)]
+            gotd_key = game_key(gotd)
+            set_gotd_pick_key(day, filter_sig, gotd_key)
+
         st.caption(f"Today: {gotd['game']} ({gotd['year']})")
         if st.button("Open Game of the Day", use_container_width=True):
-            st.session_state.selected_key = game_key(gotd)
+            record_pick("gotd", gotd_key)
+            st.session_state.selected_key = gotd_key
             st.rerun()
     else:
         st.caption("No Game of the Day with current filters.")
