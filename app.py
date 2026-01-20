@@ -255,15 +255,46 @@ def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
 
-def build_links(game_name: str):
-    q = game_name.replace(" ", "+")
-    return {
-        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
-        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
-        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
-        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
-        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
+def build_curated_links(game_name: str, rom: str | None = None) -> dict[str, list[tuple[str, str]]]:
+    """Curated, cabinet-first sources (no random Google searches).
+
+    Returns a mapping of "intent" -> list of (label, url).
+    """
+
+    q = (game_name or "").strip().replace(" ", "+")
+    rom = (rom or "").strip().lower()
+
+    links: dict[str, list[tuple[str, str]]] = {
+        "Gameplay": [
+            ("YouTube gameplay search", f"https://www.youtube.com/results?search_query={q}+arcade+gameplay"),
+        ],
+        "History / legacy": [
+            (
+                "Arcade-Museum encyclopedia search",
+                # Arcade-Museum blocks some automated fetching, but a direct link is still useful to users.
+                "https://www.arcade-museum.com/search",
+            ),
+        ],
+        "Controls / instructions": [
+            (
+                "Arcade-Museum encyclopedia search",
+                "https://www.arcade-museum.com/search",
+            ),
+        ],
+        "Ports / collections": [
+            ("YouTube ports/collections search", f"https://www.youtube.com/results?search_query={q}+arcade+collection+port"),
+        ],
     }
+
+    # Add ADB links when ROM is available
+    if rom:
+        links.setdefault("Quick refs", []).extend(
+            [
+                ("ADB (ArcadeItalia) page", f"https://adb.arcadeitalia.net/?mame={rom}"),
+            ]
+        )
+
+    return links
 
 def game_key(row: pd.Series) -> str:
     k = normalize_str(row.get("_key", "")).strip()
@@ -548,23 +579,39 @@ def show_game_details(row: pd.Series):
             update_status(rom, None)
             st.rerun()
 
-    st.write(f"**Year:** {y}")
-    if c:
-        st.write(f"**Company:** {c}")
-    if genre:
-        st.write(f"**Genre:** {genre}")
-    if platform:
-        st.write(f"**Platform:** {platform}")
-    if rom:
-        st.write(f"**ROM (MAME short name):** `{rom}`")
+    # --- Streamlined details (expanders) ---
+    with st.expander("Quick info", expanded=True):
+        st.write(f"**Year:** {y}")
+        if c:
+            st.write(f"**Company:** {c}")
+        if genre:
+            st.write(f"**Genre:** {genre}")
+        if platform:
+            st.write(f"**Platform:** {platform}")
+        if rom:
+            st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    st.markdown("###  Research links")
-    for name, url in build_links(g).items():
-        st.write(f"- {name}: {url}")
+    with st.expander("Learn / research (curated)", expanded=False):
+        intents = build_curated_links(g, rom)
+        intent_names = list(intents.keys())
 
-    st.markdown("---")
-    st.markdown("###  Arcade Database (ADB) details + artwork (on-demand)")
-    show_adb_block(rom)
+        # Default to something useful without being noisy
+        default_intent = "History / legacy" if "History / legacy" in intents else intent_names[0]
+        intent = st.selectbox(
+            "What do you want right now?",
+            intent_names,
+            index=intent_names.index(default_intent),
+            key=f"learn_intent_{rom or g}",
+        )
+        for label, url in intents.get(intent, []):
+            st.write(f"- {label}: {url}")
+
+        # Small note: Arcade-Museum has a strong encyclopedia, but its search UX varies.
+        if intent in ("History / legacy", "Controls / instructions"):
+            st.caption("Tip: use the search box on Arcade-Museum and paste the game title if needed.")
+
+    with st.expander("ADB details + artwork (on-demand)", expanded=False):
+        show_adb_block(rom)
 
 # ----------------------------
 # Boot app
