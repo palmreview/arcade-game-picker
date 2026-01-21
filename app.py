@@ -233,18 +233,28 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 # ADB (ArcadeItalia) on-demand integration
 # ----------------------------
 def adb_urls(rom: str):
-    rom = (rom or "").strip().lower()
-    page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
-    page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
+    """ADB (ArcadeItalia) endpoints.
 
+    Some users have reported the HTTPS *page* URL not resolving correctly in their environment.
+    To keep the UX reliable, the app prefers HTTP for the human-facing page link, while still
+    keeping HTTPS as an alternate.
+    """
+    rom = (rom or "").strip().lower()
+
+    # Human-facing pages
+    page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
+    page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
+
+    # JSON scraper endpoints
     params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
-    scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
     scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
+    scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
+
     return {
-        "page_https": page_https,
         "page_http": page_http,
-        "scraper_https": scraper_https,
+        "page_https": page_https,
         "scraper_http": scraper_http,
+        "scraper_https": scraper_https,
     }
 
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
@@ -273,7 +283,7 @@ def fetch_adb_details(rom: str) -> dict:
 
     urls = adb_urls(rom)
     last_err = None
-    for u in (urls["scraper_https"], urls["scraper_http"]):
+    for u in (urls["scraper_http"], urls["scraper_https"]):
         try:
             data = fetch_json_url(u, timeout_sec=12)
             st.session_state.adb_cache[rom] = data
@@ -324,8 +334,8 @@ def show_adb_block(rom: str):
 
     urls = adb_urls(rom)
     st.markdown("**ADB links:**")
-    st.write(f"- ADB page (HTTPS): {urls['page_https']}")
-    st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
+    st.write(f"- ADB page (HTTP): {urls['page_http']}")
+    st.write(f"- ADB page (HTTPS alt): {urls['page_https']}")
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
@@ -543,36 +553,6 @@ else:
 
 st.write(f"Matches: **{len(hits):,}**")
 st.divider()
-
-# ----------------------------
-# Genre timeline (simple)
-# ----------------------------
-with st.expander("📈 Genre timeline (simple)", expanded=False):
-    st.caption("Counts reflect your current filters (strict mode, status filters, platform/genre filters, etc.).")
-    timeline_genres = sorted(base["genre"].replace("", pd.NA).dropna().unique().tolist())
-    if not timeline_genres:
-        st.info("No genres available with the current filters.")
-    else:
-        selected_timeline_genres = st.multiselect(
-            "Genres to plot",
-            timeline_genres,
-            default=[],
-            help="Pick one or more genres to see how many matching games appear per year.",
-        )
-
-        timeline_df = base.copy()
-        if selected_timeline_genres:
-            timeline_df = timeline_df[timeline_df["genre"].isin(selected_timeline_genres)]
-
-        if len(timeline_df) == 0:
-            st.info("No games match the selected timeline genres with the current filters.")
-        else:
-            counts = (
-                timeline_df.groupby("year")
-                .size()
-                .reindex(range(years[0], years[1] + 1), fill_value=0)
-            )
-            st.bar_chart(counts)
 
 # ----------------------------
 # Two-panel layout
