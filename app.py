@@ -26,7 +26,10 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.1 • GOTD pool fix • Persist debug history via SQLite • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+APP_VERSION = (
+    "1.7.1 • GOTD uses base pool (not search hits) • Persist debug history via SQLite • "
+    "Details rollups (expanders) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+)
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -85,16 +88,6 @@ def get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
-def get_status(rom: str) -> str | None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return None
-    conn = get_db()
-    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
@@ -147,6 +140,7 @@ def kv_set(k: str, v: str | None) -> None:
 def log_recent_open(row: pd.Series, source: str) -> None:
     """
     Persist last 5 opens across Streamlit sleep/restart.
+    Never throw.
     """
     try:
         rom = normalize_str(row.get("rom", "")).lower()
@@ -165,8 +159,7 @@ def log_recent_open(row: pd.Series, source: str) -> None:
         if not isinstance(arr, list):
             arr = []
 
-        # de-dupe by rom if present, otherwise by (game,year)
-        def same(a, b):
+        def same(a: dict, b: dict) -> bool:
             if a.get("rom") and b.get("rom"):
                 return a.get("rom") == b.get("rom")
             return (a.get("game"), a.get("year")) == (b.get("game"), b.get("year"))
@@ -179,7 +172,6 @@ def log_recent_open(row: pd.Series, source: str) -> None:
 
         kv_set("recent_opens", json.dumps(new_arr))
     except Exception:
-        # never break the app for debug logging
         return
 
 # ----------------------------
@@ -430,7 +422,18 @@ def show_adb_block(rom: str):
         return data
 
     st.subheader("ADB Details (summary)")
-    for k in ("title", "description", "manufacturer", "year", "genre", "players", "buttons", "controls", "rotation", "status"):
+    for k in (
+        "title",
+        "description",
+        "manufacturer",
+        "year",
+        "genre",
+        "players",
+        "buttons",
+        "controls",
+        "rotation",
+        "status",
+    ):
         if k in data and data[k]:
             val = data[k]
             if isinstance(val, (dict, list)):
@@ -476,7 +479,7 @@ def update_status(rom: str, new_status: str | None):
         st.session_state.status_cache[rom] = new_status
 
 # ----------------------------
-# Details panel
+# Details panel (ROLLUP VERSION)
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -486,12 +489,13 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
-    # Status controls
+    # Header + status
     cur_status = status_for_rom(rom)
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
+    # Status controls (always visible)
     s1, s2, s3 = st.columns([1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
@@ -506,23 +510,24 @@ def show_game_details(row: pd.Series):
             update_status(rom, None)
             st.rerun()
 
-    st.write(f"**Year:** {y}")
-    if c:
-        st.write(f"**Company:** {c}")
-    if genre:
-        st.write(f"**Genre:** {genre}")
-    if platform:
-        st.write(f"**Platform:** {platform}")
-    if rom:
-        st.write(f"**ROM (MAME short name):** `{rom}`")
+    # Rollups
+    with st.expander("📌 Basics", expanded=True):
+        st.write(f"**Year:** {y}")
+        if c:
+            st.write(f"**Company:** {c}")
+        if genre:
+            st.write(f"**Genre:** {genre}")
+        if platform:
+            st.write(f"**Platform:** {platform}")
+        if rom:
+            st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    st.markdown("### 🔗 Research links")
-    for name, url in build_links(g).items():
-        st.write(f"- {name}: {url}")
+    with st.expander("🔗 Research links", expanded=False):
+        for name, url in build_links(g).items():
+            st.write(f"- {name}: {url}")
 
-    st.markdown("---")
-    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
-    show_adb_block(rom)
+    with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
+        show_adb_block(rom)
 
 # ----------------------------
 # Boot app
@@ -558,7 +563,6 @@ st.sidebar.header("✅ Status filters")
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
-# persisted debug history display
 with st.sidebar.expander("🧪 Debug: last 5 opens (persisted)", expanded=False):
     raw = kv_get("recent_opens")
     arr = json.loads(raw) if raw else []
@@ -604,7 +608,6 @@ if genre_choice:
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
-# Apply status filters
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
@@ -679,21 +682,19 @@ with left:
 
     st.markdown("### 📆 Game of the Day")
 
-    # IMPORTANT FIX:
-    # GOTD should NOT depend on the Search box (hits). It should use the full filtered pool (base).
+    # GOTD FIX:
+    # - uses base (full filtered pool) instead of hits (search-affected)
     now = datetime.now(TZ)
     seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-    gotd_pool = base  # not hits
+    gotd_pool = base
 
     if len(gotd_pool) > 0:
         gotd_idx = seed % len(gotd_pool)
         gotd = gotd_pool.iloc[gotd_idx]
         st.caption(f"Today: {gotd['game']} ({gotd['year']})")
 
-        # small debug line so you can see when pool collapses to 1, etc.
-        st.caption(
-            f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool={len(gotd_pool)} idx={gotd_idx}"
-        )
+        # debug to confirm pool size + index (helps diagnose "stuck GOTD")
+        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool={len(gotd_pool)} idx={gotd_idx}")
 
         if st.button("Open Game of the Day", use_container_width=True):
             log_recent_open(gotd, "Game of the Day")
@@ -701,14 +702,11 @@ with left:
             st.rerun()
     else:
         st.caption("No Game of the Day with current filters.")
-        st.caption(
-            f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool=0 (widen filters)"
-        )
+        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool=0 (widen filters)")
 
     st.markdown("---")
     st.markdown("## 📜 Browse list")
 
-    # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
     view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
@@ -732,7 +730,6 @@ with left:
         selected_row = view.loc[idx]
 
         if st.button("➡️ Open selected", use_container_width=True):
-            # selected_row comes from view (has rom/game/year) which is enough for logging
             log_recent_open(selected_row, "Browse select")
             st.session_state.selected_key = game_key(selected_row)
             st.rerun()
