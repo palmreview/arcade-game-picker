@@ -15,21 +15,12 @@ import streamlit as st
 # ----------------------------
 st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 
-st.title("🕹️ Arcade Game Picker (1978–2008)")
-st.caption(
-    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Status (Want to Play / Played) is stored globally in a server-side SQLite DB."
-)
-
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = (
-    "1.7.1 • GOTD uses base pool (not search hits) • Persist debug history via SQLite • "
-    "Details rollups (expanders) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
-)
+
+APP_VERSION = "1.8 • Pass-1 UI Streamline • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -42,6 +33,43 @@ STATUS_LABELS = {
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
 }
+
+# ----------------------------
+# Cabinet profile + strict compatibility
+# ----------------------------
+CABINET_SUMMARY = (
+    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, NO spinner/trackball/lightgun/wheel, "
+    "horizontal monitor (vertical OK)."
+)
+
+BLOCKED_GENRE_EXACT = {
+    "trackball",
+    "dial/paddle",
+    "dial",
+    "paddle",
+    "lightgun shooter",
+    "gambling",
+    "casino",
+    "quiz",
+}
+
+BLOCKED_GENRE_CONTAINS = [
+    "driving",
+    "racing",
+    "pinball",
+    "redemption",
+]
+
+BLOCKED_TITLE_HINTS = [
+    "lightgun",
+    "light gun",
+    "trackball",
+    "spinner",
+    "steering",
+    "wheel",
+    "pedal",
+    "paddle",
+]
 
 # ----------------------------
 # DB (global state across devices)
@@ -61,16 +89,6 @@ def init_db() -> None:
         )
         """
     )
-    # small key-value store for persisted debug/history (survives Streamlit sleep/restart)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_kv (
-            k TEXT PRIMARY KEY,
-            v TEXT,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
     conn.commit()
     conn.close()
 
@@ -82,11 +100,22 @@ def get_all_statuses() -> dict[str, str]:
     cur = conn.execute("SELECT rom, status FROM game_status")
     rows = cur.fetchall()
     conn.close()
+
     out = {}
     for rom, status in rows:
         if rom:
             out[str(rom).strip().lower()] = status
     return out
+
+def get_status(rom: str) -> str | None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return None
+    conn = get_db()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
@@ -108,71 +137,6 @@ def set_status(rom: str, status: str | None) -> None:
         )
     conn.commit()
     conn.close()
-
-# ----------------------------
-# Persisted debug/history KV (survives restarts)
-# ----------------------------
-def kv_get(k: str) -> str | None:
-    conn = get_db()
-    cur = conn.execute("SELECT v FROM app_kv WHERE k=?", (k,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def kv_set(k: str, v: str | None) -> None:
-    conn = get_db()
-    if v is None:
-        conn.execute("DELETE FROM app_kv WHERE k=?", (k,))
-    else:
-        conn.execute(
-            """
-            INSERT INTO app_kv (k, v, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(k) DO UPDATE SET
-                v=excluded.v,
-                updated_at=datetime('now')
-            """,
-            (k, v),
-        )
-    conn.commit()
-    conn.close()
-
-def log_recent_open(row: pd.Series, source: str) -> None:
-    """
-    Persist last 5 opens across Streamlit sleep/restart.
-    Never throw.
-    """
-    try:
-        rom = normalize_str(row.get("rom", "")).lower()
-        game = normalize_str(row.get("game", ""))
-        year = int(row.get("year", 0) or 0)
-        item = {
-            "ts": datetime.now(TZ).isoformat(timespec="seconds"),
-            "source": source,
-            "rom": rom,
-            "game": game,
-            "year": year,
-        }
-
-        raw = kv_get("recent_opens")
-        arr = json.loads(raw) if raw else []
-        if not isinstance(arr, list):
-            arr = []
-
-        def same(a: dict, b: dict) -> bool:
-            if a.get("rom") and b.get("rom"):
-                return a.get("rom") == b.get("rom")
-            return (a.get("game"), a.get("year")) == (b.get("game"), b.get("year"))
-
-        new_arr = [item]
-        for x in arr:
-            if isinstance(x, dict) and not same(x, item):
-                new_arr.append(x)
-        new_arr = new_arr[:5]
-
-        kv_set("recent_opens", json.dumps(new_arr))
-    except Exception:
-        return
 
 # ----------------------------
 # Helpers: normalization / dataset
@@ -237,42 +201,8 @@ def init_state():
         st.session_state.status_cache_loaded = False
 
 # ----------------------------
-# Cabinet profile + strict compatibility
+# Strict cabinet compatibility
 # ----------------------------
-CABINET_SUMMARY = (
-    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, NO spinner/trackball/lightgun/wheel, "
-    "horizontal monitor (vertical OK)."
-)
-
-BLOCKED_GENRE_EXACT = {
-    "trackball",
-    "dial/paddle",
-    "dial",
-    "paddle",
-    "lightgun shooter",
-    "gambling",
-    "casino",
-    "quiz",
-}
-
-BLOCKED_GENRE_CONTAINS = [
-    "driving",
-    "racing",
-    "pinball",
-    "redemption",
-]
-
-BLOCKED_TITLE_HINTS = [
-    "lightgun",
-    "light gun",
-    "trackball",
-    "spinner",
-    "steering",
-    "wheel",
-    "pedal",
-    "paddle",
-]
-
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -319,7 +249,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.7; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.8; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -391,6 +321,7 @@ def show_adb_block(rom: str):
         return None
 
     urls = adb_urls(rom)
+
     st.markdown("**ADB links:**")
     st.write(f"- ADB page (HTTPS): {urls['page_https']}")
     st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
@@ -421,7 +352,7 @@ def show_adb_block(rom: str):
             st.caption(f"Details: {data['_detail']}")
         return data
 
-    st.subheader("ADB Details (summary)")
+    st.markdown("#### ADB Details (summary)")
     for k in (
         "title",
         "description",
@@ -445,7 +376,7 @@ def show_adb_block(rom: str):
     if show_images:
         imgs = extract_image_urls(data)
         if imgs:
-            st.subheader("Artwork / Images")
+            st.markdown("#### Artwork / Images")
             for u in imgs[:10]:
                 st.image(u, use_container_width=True)
         else:
@@ -479,7 +410,7 @@ def update_status(rom: str, new_status: str | None):
         st.session_state.status_cache[rom] = new_status
 
 # ----------------------------
-# Details panel (ROLLUP VERSION)
+# Details panel (streamlined)
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -489,13 +420,14 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
-    # Header + status
     cur_status = status_for_rom(rom)
-    st.markdown(f"## {g}")
-    st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
-    st.caption(CABINET_SUMMARY)
 
-    # Status controls (always visible)
+    # --- calm summary "card"
+    st.markdown(f"## {g}")
+    st.caption(CABINET_SUMMARY)
+    st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
+
+    # Status controls
     s1, s2, s3 = st.columns([1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
@@ -510,8 +442,10 @@ def show_game_details(row: pd.Series):
             update_status(rom, None)
             st.rerun()
 
-    # Rollups
-    with st.expander("📌 Basics", expanded=True):
+    st.divider()
+
+    # --- progressive disclosure
+    with st.expander("📌 Quick facts", expanded=True):
         st.write(f"**Year:** {y}")
         if c:
             st.write(f"**Company:** {c}")
@@ -535,6 +469,13 @@ def show_game_details(row: pd.Series):
 init_state()
 init_db()
 
+st.title("🕹️ Arcade Game Picker (1978–2008)")
+st.caption(
+    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
+    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
+    "Status (Want to Play / Played) is stored globally in a server-side SQLite DB."
+)
+
 # Load dataset (no caching)
 try:
     df = load_games_no_cache()
@@ -546,54 +487,54 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
-# Load status cache once per session (global data)
+# Load status cache once per session
 load_status_cache_once()
 
 # ----------------------------
-# Sidebar: Cabinet mode + status filtering + debug history
+# Sidebar: streamlined core + advanced expander
 # ----------------------------
-st.sidebar.header("🎛️ Cabinet Mode")
+st.sidebar.header("🎛️ Controls")
 st.sidebar.caption(APP_VERSION)
 
+# Core always-visible controls
+st.sidebar.subheader("Cabinet + Status")
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("✅ Status filters")
-
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
-with st.sidebar.expander("🧪 Debug: last 5 opens (persisted)", expanded=False):
-    raw = kv_get("recent_opens")
-    arr = json.loads(raw) if raw else []
-    if not arr:
-        st.caption("No history yet (it will persist after you open games).")
-    else:
-        for x in arr[:5]:
-            if not isinstance(x, dict):
-                continue
-            st.write(f"- {x.get('game','?')} ({x.get('year','?')}) — {x.get('source','?')} — {x.get('ts','?')}")
-    if st.button("Clear debug history", use_container_width=True):
-        kv_set("recent_opens", None)
-        st.rerun()
+st.sidebar.divider()
 
-st.sidebar.markdown("---")
-st.sidebar.header("Filters")
+# Search moved to sidebar to reduce main clutter
+st.sidebar.subheader("Search")
+search_name = st.sidebar.text_input("Name or ROM", "")
 
-years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
-platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
-genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
+# Advanced filters collapsed
+with st.sidebar.expander("Advanced filters", expanded=False):
+    years = st.slider("Year range", 1978, 2008, (1978, 2008))
 
-platform_choice = st.sidebar.multiselect("Platform (optional)", platforms)
-genre_choice = st.sidebar.multiselect("Genre (optional)", genres)
+    platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
+    genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
 
-st.sidebar.markdown("---")
-try:
-    p = Path(CSV_PATH)
-    st.sidebar.caption(f"CSV rows: {len(df):,}")
-    st.sidebar.caption(f"CSV modified (server): {datetime.fromtimestamp(p.stat().st_mtime)}")
-except Exception:
-    pass
+    platform_choice = st.multiselect("Platform (optional)", platforms)
+    genre_choice = st.multiselect("Genre (optional)", genres)
+
+    st.caption("Tip: leave these empty most of the time—use Search + Random for fast discovery.")
+
+with st.sidebar.expander("Dataset info", expanded=False):
+    try:
+        p = Path(CSV_PATH)
+        st.caption(f"CSV rows: {len(df):,}")
+        st.caption(f"CSV modified (server): {datetime.fromtimestamp(p.stat().st_mtime)}")
+    except Exception:
+        st.caption("Dataset info unavailable.")
+
+# Default values if Advanced filters hasn't been opened yet
+if "years" not in locals():
+    years = (1978, 2008)
+if "platform_choice" not in locals():
+    platform_choice = []
+if "genre_choice" not in locals():
+    genre_choice = []
 
 # ----------------------------
 # Build filtered view
@@ -620,12 +561,7 @@ def keep_by_status(row: pd.Series) -> bool:
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
 
-# ----------------------------
-# Search
-# ----------------------------
-st.markdown("## 🔎 Search")
-search_name = st.text_input("Search by name or ROM (e.g., pacman, sf2, metal slug)", "")
-
+# Apply search
 if search_name.strip():
     s = search_name.strip().lower()
     hits = base[
@@ -635,23 +571,19 @@ if search_name.strip():
 else:
     hits = base.copy()
 
-st.write(f"Matches: **{len(hits):,}**")
-st.divider()
-
 # ----------------------------
 # Two-panel layout
 # ----------------------------
 left, right = st.columns([1.15, 1.0], gap="large")
 
 with left:
-    st.markdown("## 🎲 Discover (cabinet-ready)")
+    st.subheader("🎲 Discover")
 
-    c1, c2, c3 = st.columns(3)
+    # Primary actions (always visible)
+    c1, c2 = st.columns([1, 1])
     with c1:
         pick_random = st.button("🎲 Random", use_container_width=True)
     with c2:
-        pick_10 = st.button("🎯 10 Picks", use_container_width=True)
-    with c3:
         clear_sel = st.button("🧹 Clear selection", use_container_width=True)
 
     if clear_sel:
@@ -659,99 +591,102 @@ with left:
         st.session_state.selected_key = None
         st.rerun()
 
-    if pick_random:
-        if len(hits) == 0:
-            st.warning("No games match your current strict cabinet + status filters. Widen filters.")
-        else:
-            row = hits.sample(1).iloc[0]
-            log_recent_open(row, "Random")
-            st.session_state.selected_key = game_key(row)
-            st.rerun()
-
-    if pick_10:
-        if len(hits) == 0:
-            st.warning("No games match your current strict cabinet + status filters. Widen filters.")
-        else:
-            n = min(10, len(hits))
-            sample = hits.sample(n).copy()
-            st.session_state.picked_rows = sample.to_dict("records")
-            first = pd.Series(st.session_state.picked_rows[0])
-            log_recent_open(first, "10 Picks (auto-open first)")
-            st.session_state.selected_key = game_key(first)
-            st.rerun()
-
-    st.markdown("### 📆 Game of the Day")
-
-    # GOTD FIX:
-    # - uses base (full filtered pool) instead of hits (search-affected)
+    # Game of the Day (simple, visible, not noisy)
+    st.markdown("#### 📆 Game of the Day")
     now = datetime.now(TZ)
     seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-    gotd_pool = base
 
-    if len(gotd_pool) > 0:
-        gotd_idx = seed % len(gotd_pool)
-        gotd = gotd_pool.iloc[gotd_idx]
-        st.caption(f"Today: {gotd['game']} ({gotd['year']})")
-
-        # debug to confirm pool size + index (helps diagnose "stuck GOTD")
-        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool={len(gotd_pool)} idx={gotd_idx}")
-
+    if len(hits) > 0:
+        gotd = hits.iloc[seed % len(hits)]
+        st.caption(f"Today: **{gotd['game']}** ({gotd['year']})")
         if st.button("Open Game of the Day", use_container_width=True):
-            log_recent_open(gotd, "Game of the Day")
             st.session_state.selected_key = game_key(gotd)
             st.rerun()
     else:
         st.caption("No Game of the Day with current filters.")
-        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool=0 (widen filters)")
 
-    st.markdown("---")
-    st.markdown("## 📜 Browse list")
-
-    view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
-    view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
-
-    st.dataframe(view, use_container_width=True, height=420)
-
-    st.markdown("### Select a game")
-    if len(view) == 0:
-        st.info("No results to select. Adjust filters.")
-    else:
-        labels = (
-            view["game"].astype(str)
-            + " — "
-            + view["year"].astype(str)
-            + " — "
-            + view["company"].astype(str)
-            + " — "
-            + view["status"].astype(str)
-        )
-        selected_label = st.selectbox("Pick from results", labels, key="browse_select")
-        idx = labels[labels == selected_label].index[0]
-        selected_row = view.loc[idx]
-
-        if st.button("➡️ Open selected", use_container_width=True):
-            log_recent_open(selected_row, "Browse select")
-            st.session_state.selected_key = game_key(selected_row)
+    # Random action
+    if pick_random:
+        if len(hits) == 0:
+            st.warning("No games match your current cabinet + status filters. Widen filters.")
+        else:
+            row = hits.sample(1).iloc[0]
+            st.session_state.selected_key = game_key(row)
             st.rerun()
 
-    if st.session_state.picked_rows:
-        st.markdown("---")
-        st.markdown("## 🎯 Your 10 picks")
-        pick_df = pd.DataFrame(st.session_state.picked_rows)
-        pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
-        pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
+    st.divider()
 
-        for i, r in pick_df.iterrows():
-            label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
-            if st.button(label, key=f"pick_{i}", use_container_width=True):
-                log_recent_open(r, "10 Picks (manual open)")
-                st.session_state.selected_key = game_key(r)
+    # Secondary discovery (collapsed)
+    with st.expander("More ways to discover", expanded=True):
+        st.caption(f"Matches: **{len(hits):,}**")
+
+        c3, c4 = st.columns([1, 1])
+        with c3:
+            pick_10 = st.button("🎯 10 Picks", use_container_width=True)
+        with c4:
+            clear_picks = st.button("🧽 Clear 10 Picks", use_container_width=True)
+
+        if clear_picks:
+            st.session_state.picked_rows = []
+            st.rerun()
+
+        if pick_10:
+            if len(hits) == 0:
+                st.warning("No games match your current filters. Widen filters.")
+            else:
+                n = min(10, len(hits))
+                sample = hits.sample(n).copy()
+                st.session_state.picked_rows = sample.to_dict("records")
+                st.session_state.selected_key = game_key(pd.Series(st.session_state.picked_rows[0]))
                 st.rerun()
 
+        st.markdown("##### 📜 Browse list")
+        view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
+        view["status"] = view["rom"].apply(
+            lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—")
+        )
+
+        st.dataframe(view, use_container_width=True, height=360)
+
+        st.markdown("##### Select a game")
+        if len(view) == 0:
+            st.info("No results to select. Adjust filters.")
+        else:
+            labels = (
+                view["game"].astype(str)
+                + " — "
+                + view["year"].astype(str)
+                + " — "
+                + view["company"].astype(str)
+                + " — "
+                + view["status"].astype(str)
+            )
+            selected_label = st.selectbox("Pick from results", labels, key="browse_select")
+            idx = labels[labels == selected_label].index[0]
+            selected_row = view.loc[idx]
+
+            if st.button("➡️ Open selected", use_container_width=True):
+                st.session_state.selected_key = game_key(selected_row)
+                st.rerun()
+
+        if st.session_state.picked_rows:
+            st.markdown("##### 🎯 Your 10 picks")
+            pick_df = pd.DataFrame(st.session_state.picked_rows)
+            pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
+            pick_df["status"] = pick_df["rom"].apply(
+                lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—")
+            )
+
+            for i, r in pick_df.iterrows():
+                label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
+                if st.button(label, key=f"pick_{i}", use_container_width=True):
+                    st.session_state.selected_key = game_key(r)
+                    st.rerun()
+
 with right:
-    st.markdown("## 🧾 Details")
+    st.subheader("🧾 Details")
     if not st.session_state.selected_key:
-        st.info("Pick a game from the list or hit Random/10 Picks to see details.")
+        st.info("Pick a game from the left (Random / Game of the Day / Browse) to see details.")
     else:
         key = st.session_state.selected_key
 
