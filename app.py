@@ -21,7 +21,7 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 TZ = ZoneInfo("America/New_York")
 
 APP_VERSION = (
-    "1.9 • Pass-1 UI Streamline + Want Export + Not Playable • "
+    "1.10 • Pass-1 UI Streamline + Want Export + Not Playable + Don't Have ROM • "
     "Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 )
 
@@ -30,13 +30,15 @@ DB_PATH = "game_state.db"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
-STATUS_BLOCKED = "not_playable"  # NEW: exclude from discovery by default
+STATUS_BLOCKED = "not_playable"     # exclude from discovery by default
+STATUS_NO_ROM = "dont_have_rom"     # NEW: exclude from discovery by default
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
     STATUS_BLOCKED: "🚫 Not playable",
+    STATUS_NO_ROM: "🧩 Don't have ROM",
 }
 
 # ----------------------------
@@ -271,7 +273,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.9; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.10; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -471,7 +473,7 @@ def build_want_to_play_txt(df: pd.DataFrame) -> str:
 
 
 # ----------------------------
-# Details panel (streamlined) + Not Playable
+# Details panel (streamlined) + statuses
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -488,12 +490,13 @@ def show_game_details(row: pd.Series):
     st.caption(CABINET_SUMMARY)
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
 
-    # If blocked, make it obvious why it disappears from discovery
     if cur_status == STATUS_BLOCKED:
         st.warning("This game is marked 🚫 Not playable and is hidden from discovery by default.")
+    elif cur_status == STATUS_NO_ROM:
+        st.info("This game is marked 🧩 Don't have ROM and is excluded from discovery by default.")
 
-    # Status controls (now includes 🚫 Not playable)
-    s1, s2, s3, s4 = st.columns([1, 1, 1, 1])
+    # Status controls (Want / Played / Don't have ROM / Not playable / Clear)
+    s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
@@ -503,10 +506,14 @@ def show_game_details(row: pd.Series):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
     with s3:
+        if st.button("🧩 Don't have ROM", use_container_width=True, key=f"st_norom_{rom}"):
+            update_status(rom, STATUS_NO_ROM)
+            st.rerun()
+    with s4:
         if st.button("🚫 Not playable", use_container_width=True, key=f"st_block_{rom}"):
             update_status(rom, STATUS_BLOCKED)
             st.rerun()
-    with s4:
+    with s5:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
@@ -543,7 +550,7 @@ st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
     "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Status (Want to Play / Played / Not playable) is stored globally in a server-side SQLite DB."
+    "Status (Want / Played / Don't have ROM / Not playable) is stored globally in a server-side SQLite DB."
 )
 
 # Load dataset (no caching)
@@ -572,8 +579,9 @@ strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", valu
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
-# NEW: show/hide blocked
+# NEW: show/hide excluded statuses
 show_blocked = st.sidebar.toggle("Show 🚫 Not playable", value=False)
+show_no_rom = st.sidebar.toggle("Show 🧩 Don't have ROM", value=False)
 
 # Export block (Want to Play)
 st.sidebar.divider()
@@ -641,8 +649,10 @@ def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
 
-    # Hide blocked unless explicitly shown
+    # Hide excluded statuses unless explicitly shown
     if (not show_blocked) and s == STATUS_BLOCKED:
+        return False
+    if (not show_no_rom) and s == STATUS_NO_ROM:
         return False
 
     if only_want:
