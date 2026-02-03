@@ -20,7 +20,7 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
 
-APP_VERSION = "1.8 • Pass-1 UI Streamline • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+APP_VERSION = "1.8 • Pass-1 UI Streamline + Want Export • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -410,6 +410,36 @@ def update_status(rom: str, new_status: str | None):
         st.session_state.status_cache[rom] = new_status
 
 # ----------------------------
+# Export: Want to Play (.txt)
+# ----------------------------
+def build_want_to_play_txt(df: pd.DataFrame) -> str:
+    """
+    Build a plain-text export of Want to Play games.
+    One game per line, sorted by year then title.
+    """
+    want_roms = {
+        rom for rom, status in st.session_state.status_cache.items()
+        if status == STATUS_WANT
+    }
+
+    if not want_roms:
+        return "No games marked as Want to Play."
+
+    subset = df[df["rom"].isin(want_roms)].copy()
+    subset = subset.sort_values(["year", "game"])
+
+    lines = []
+    for _, row in subset.iterrows():
+        game = row.get("game", "")
+        year = row.get("year", "")
+        company = row.get("company", "")
+        genre = row.get("genre", "")
+        rom = row.get("rom", "")
+        lines.append(f"{game} ({year}) — {company} — {genre} — ROM: {rom}")
+
+    return "\n".join(lines)
+
+# ----------------------------
 # Details panel (streamlined)
 # ----------------------------
 def show_game_details(row: pd.Series):
@@ -501,6 +531,20 @@ st.sidebar.subheader("Cabinet + Status")
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
+
+# Export block (Want to Play)
+st.sidebar.divider()
+st.sidebar.subheader("Export")
+want_count = sum(1 for s in st.session_state.status_cache.values() if s == STATUS_WANT)
+txt_data = build_want_to_play_txt(df)
+
+st.sidebar.download_button(
+    label=f"📤 Export Want to Play ({want_count})",
+    data=txt_data,
+    file_name="arcade_want_to_play.txt",
+    mime="text/plain",
+    use_container_width=True,
+)
 
 st.sidebar.divider()
 
