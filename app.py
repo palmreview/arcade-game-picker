@@ -3,7 +3,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -15,38 +15,269 @@ import streamlit as st
 # ----------------------------
 st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 
+st.title("🕹️ Arcade Game Picker (1978–2008)")
+st.caption(
+    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
+    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
+    "Status (Want / Played / Not playable / Don't have ROM) is stored persistently in Supabase (with SQLite fallback)."
+)
+
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-
 APP_VERSION = (
-    "1.10 • Pass-1 UI Streamline + Want Export + Not Playable + Don't Have ROM • "
-    "Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+    "1.8.0 • Supabase persistence for status • GOTD uses base pool • "
+    "Details rollups • Strict Cabinet Mode • ADB on-demand • No CSV caching"
 )
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
-DB_PATH = "game_state.db"
+DB_PATH = "game_state.db"  # fallback only (local)
 
+# Status values
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
-STATUS_BLOCKED = "not_playable"     # exclude from discovery by default
-STATUS_NO_ROM = "dont_have_rom"     # NEW: exclude from discovery by default
+STATUS_NOT_PLAYABLE = "not_playable"
+STATUS_NO_ROM = "dont_have_rom"
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
-    STATUS_BLOCKED: "🚫 Not playable",
-    STATUS_NO_ROM: "🧩 Don't have ROM",
+    STATUS_NOT_PLAYABLE: "🚫 Not playable",
+    STATUS_NO_ROM: "📦 Don’t have ROM",
 }
+
+# ----------------------------
+# Supabase config (preferred persistence)
+# ----------------------------
+def _get_secret(name: str) -> str | None:
+    # Streamlit secrets preferred; fallback to env via st.secrets if present
+    try:
+        v = st.secrets.get(name)
+        if v is not None:
+            return str(v).strip()
+    except Exception:
+        pass
+    return None
+
+SUPABASE_URL = _get_secret("SUPABASE_URL")
+SUPABASE_KEY = _get_secret("SUPABASE_KEY")  # Anon key works if RLS policies allow; service role works without RLS.
+
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+
+def _sb_url(path: str) -> str:
+    return f"{SUPABASE_URL.rstrip('/')}{path}"
+
+def supabase_request(method: str, path: str, params: dict | None = None, body: object | None = None, timeout_sec: int = 15):
+    """
+    Minimal PostgREST client using urllib (no extra deps).
+    """
+    if not USE_SUPABASE:
+        raise RuntimeError("Supabase not configured (missing SUPABASE_URL or SUPABASE_KEY).")
+
+    url = _sb_url(path)
+    if params:
+        url += "?" + urlencode(params)
+
+    data = None
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = Request(url, data=data, method=method.upper(), headers=headers)
+    with urlopen(req, timeout=timeout_sec) as resp:
+        raw = resp.read()
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None
+        return json.loads(text)
+
+# ----------------------------
+# SQLite fallback (only used if Supabase not configured)
+# ----------------------------
+def get_db() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db_sqlite() -> None:
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_status (
+            rom TEXT PRIMARY KEY,
+            status TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+def get_all_statuses_sqlite() -> dict[str, str]:
+    conn = get_db()
+    cur = conn.execute("SELECT rom, status FROM game_status")
+    rows = cur.fetchall()
+    conn.close()
+    out = {}
+    for rom, status in rows:
+        if rom:
+            out[str(rom).strip().lower()] = status
+    return out
+
+def set_status_sqlite(rom: str, status: str | None) -> None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+    conn = get_db()
+    if status is None:
+        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
+    else:
+        conn.execute(
+            """
+            INSERT INTO game_status (rom, status, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(rom) DO UPDATE SET
+                status=excluded.status,
+                updated_at=datetime('now')
+            """,
+            (rom, status),
+        )
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# Status persistence (Supabase preferred)
+# Table expected in Supabase:
+#   game_status(rom text primary key, status text, updated_at timestamptz default now())
+# ----------------------------
+def init_persistence() -> None:
+    """
+    No-op for Supabase (table should already exist).
+    For SQLite fallback, create local table.
+    """
+    if not USE_SUPABASE:
+        init_db_sqlite()
+
+def get_all_statuses() -> dict[str, str]:
+    """
+    Returns mapping: rom -> status
+    """
+    if USE_SUPABASE:
+        # GET /rest/v1/game_status?select=rom,status
+        data = supabase_request("GET", "/rest/v1/game_status", params={"select": "rom,status"})
+        out = {}
+        if isinstance(data, list):
+            for row in data:
+                rom = (row.get("rom") or "").strip().lower()
+                status = row.get("status")
+                if rom:
+                    out[rom] = status
+        return out
+    return get_all_statuses_sqlite()
+
+def set_status(rom: str, status: str | None) -> None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+
+    if USE_SUPABASE:
+        if status is None:
+            # DELETE /rest/v1/game_status?rom=eq.<rom>
+            supabase_request("DELETE", "/rest/v1/game_status", params={"rom": f"eq.{rom}"})
+            return
+
+        # UPSERT:
+        # POST /rest/v1/game_status?on_conflict=rom
+        # Prefer: resolution=merge-duplicates
+        url = _sb_url("/rest/v1/game_status") + "?" + urlencode({"on_conflict": "rom"})
+        body = {"rom": rom, "status": status}
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        req = Request(url, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
+        with urlopen(req, timeout=15) as resp:
+            resp.read()
+        return
+
+    set_status_sqlite(rom, status)
+
+# ----------------------------
+# Helpers: normalization / dataset
+# ----------------------------
+def normalize_str(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["rom", "game", "year", "company", "genre", "platform"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["rom"] = df["rom"].map(normalize_str).str.lower()
+    df["game"] = df["game"].map(normalize_str)
+    df["company"] = df["company"].map(normalize_str)
+    df["genre"] = df["genre"].map(normalize_str)
+    df["platform"] = df["platform"].map(normalize_str)
+
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df.dropna(subset=["game", "year"]).copy()
+    df["year"] = df["year"].astype(int)
+
+    df["_game_l"] = df["game"].astype(str).str.lower()
+    df["_genre_l"] = df["genre"].astype(str).str.lower()
+    df["_platform_l"] = df["platform"].astype(str).str.lower()
+    df["_company_l"] = df["company"].astype(str).str.lower()
+
+    return df
+
+def load_games_no_cache() -> pd.DataFrame:
+    df = pd.read_csv(CSV_PATH)
+    return ensure_columns(df)
+
+def build_links(game_name: str):
+    q = game_name.replace(" ", "+")
+    return {
+        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
+        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
+        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
+        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
+        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
+    }
+
+def game_key(row: pd.Series) -> str:
+    rom = normalize_str(row.get("rom", "")).lower()
+    if rom:
+        return f"rom:{rom}"
+    return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
+
+def init_state():
+    if "picked_rows" not in st.session_state:
+        st.session_state.picked_rows = []
+    if "selected_key" not in st.session_state:
+        st.session_state.selected_key = None
+    if "adb_cache" not in st.session_state:
+        st.session_state.adb_cache = {}
+    if "status_cache" not in st.session_state:
+        st.session_state.status_cache = {}
+    if "status_cache_loaded" not in st.session_state:
+        st.session_state.status_cache_loaded = False
 
 # ----------------------------
 # Cabinet profile + strict compatibility
 # ----------------------------
 CABINET_SUMMARY = (
-    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, NO spinner/trackball/lightgun/wheel, "
-    "horizontal monitor (vertical OK)."
+    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, 6 buttons/player, "
+    "NO spinner/trackball/lightgun/wheel, horizontal monitor (vertical OK)."
 )
 
 BLOCKED_GENRE_EXACT = {
@@ -78,153 +309,6 @@ BLOCKED_TITLE_HINTS = [
     "paddle",
 ]
 
-# ----------------------------
-# DB (global state across devices)
-# ----------------------------
-def get_db() -> sqlite3.Connection:
-    # check_same_thread False is fine for Streamlit single-process usage
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-
-def init_db() -> None:
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS game_status (
-            rom TEXT PRIMARY KEY,
-            status TEXT,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_all_statuses() -> dict[str, str]:
-    """
-    Returns mapping: rom -> status
-    """
-    conn = get_db()
-    cur = conn.execute("SELECT rom, status FROM game_status")
-    rows = cur.fetchall()
-    conn.close()
-
-    out: dict[str, str] = {}
-    for rom, status in rows:
-        if rom:
-            out[str(rom).strip().lower()] = status
-    return out
-
-
-def get_status(rom: str) -> str | None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return None
-    conn = get_db()
-    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def set_status(rom: str, status: str | None) -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    conn = get_db()
-    if status is None:
-        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-    else:
-        conn.execute(
-            """
-            INSERT INTO game_status (rom, status, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(rom) DO UPDATE SET
-                status=excluded.status,
-                updated_at=datetime('now')
-            """,
-            (rom, status),
-        )
-    conn.commit()
-    conn.close()
-
-
-# ----------------------------
-# Helpers: normalization / dataset
-# ----------------------------
-def normalize_str(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["rom", "game", "year", "company", "genre", "platform"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    df["rom"] = df["rom"].map(normalize_str).str.lower()
-    df["game"] = df["game"].map(normalize_str)
-    df["company"] = df["company"].map(normalize_str)
-    df["genre"] = df["genre"].map(normalize_str)
-    df["platform"] = df["platform"].map(normalize_str)
-
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df = df.dropna(subset=["game", "year"]).copy()
-    df["year"] = df["year"].astype(int)
-
-    df["_game_l"] = df["game"].astype(str).str.lower()
-    df["_genre_l"] = df["genre"].astype(str).str.lower()
-    df["_platform_l"] = df["platform"].astype(str).str.lower()
-    df["_company_l"] = df["company"].astype(str).str.lower()
-
-    return df
-
-
-def load_games_no_cache() -> pd.DataFrame:
-    df = pd.read_csv(CSV_PATH)
-    return ensure_columns(df)
-
-
-def build_links(game_name: str):
-    q = game_name.replace(" ", "+")
-    return {
-        "Gameplay (YouTube)": f"https://www.youtube.com/results?search_query={q}+arcade+gameplay",
-        "History / Legacy (search)": f"https://www.google.com/search?q={q}+arcade+history+legacy",
-        "Controls / Moves (search)": f"https://www.google.com/search?q={q}+arcade+controls+buttons",
-        "Manual / Instructions (search)": f"https://www.google.com/search?q={q}+arcade+manual+instructions",
-        "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
-    }
-
-
-def game_key(row: pd.Series) -> str:
-    rom = normalize_str(row.get("rom", "")).lower()
-    if rom:
-        return f"rom:{rom}"
-    return (
-        f"meta:{normalize_str(row.get('game',''))}|"
-        f"{int(row.get('year',0))}|"
-        f"{normalize_str(row.get('company',''))}"
-    )
-
-
-def init_state():
-    if "picked_rows" not in st.session_state:
-        st.session_state.picked_rows = []
-    if "selected_key" not in st.session_state:
-        st.session_state.selected_key = None
-    if "adb_cache" not in st.session_state:
-        st.session_state.adb_cache = {}
-    if "status_cache" not in st.session_state:
-        st.session_state.status_cache = {}
-    if "status_cache_loaded" not in st.session_state:
-        st.session_state.status_cache_loaded = False
-
-
-# ----------------------------
-# Strict cabinet compatibility
-# ----------------------------
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -249,7 +333,6 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 
     return True
 
-
 # ----------------------------
 # ADB (ArcadeItalia) on-demand integration
 # ----------------------------
@@ -268,12 +351,11 @@ def adb_urls(rom: str):
         "scraper_http": scraper_http,
     }
 
-
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.10; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.8; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -284,7 +366,6 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     if isinstance(data, dict):
         return data
     return {"_data": data}
-
 
 def fetch_adb_details(rom: str) -> dict:
     rom = (rom or "").strip().lower()
@@ -313,9 +394,8 @@ def fetch_adb_details(rom: str) -> dict:
     st.session_state.adb_cache[rom] = out
     return out
 
-
 def extract_image_urls(obj) -> list[str]:
-    urls: list[str] = []
+    urls = []
 
     def walk(x):
         if isinstance(x, dict):
@@ -333,13 +413,12 @@ def extract_image_urls(obj) -> list[str]:
     walk(obj)
 
     seen = set()
-    out: list[str] = []
+    out = []
     for u in urls:
         if u not in seen:
             seen.add(u)
             out.append(u)
     return out
-
 
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
@@ -348,7 +427,6 @@ def show_adb_block(rom: str):
         return None
 
     urls = adb_urls(rom)
-
     st.markdown("**ADB links:**")
     st.write(f"- ADB page (HTTPS): {urls['page_https']}")
     st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
@@ -379,19 +457,8 @@ def show_adb_block(rom: str):
             st.caption(f"Details: {data['_detail']}")
         return data
 
-    st.markdown("#### ADB Details (summary)")
-    for k in (
-        "title",
-        "description",
-        "manufacturer",
-        "year",
-        "genre",
-        "players",
-        "buttons",
-        "controls",
-        "rotation",
-        "status",
-    ):
+    st.subheader("ADB Details (summary)")
+    for k in ("title", "description", "manufacturer", "year", "genre", "players", "buttons", "controls", "rotation", "status"):
         if k in data and data[k]:
             val = data[k]
             if isinstance(val, (dict, list)):
@@ -403,7 +470,7 @@ def show_adb_block(rom: str):
     if show_images:
         imgs = extract_image_urls(data)
         if imgs:
-            st.markdown("#### Artwork / Images")
+            st.subheader("Artwork / Images")
             for u in imgs[:10]:
                 st.image(u, use_container_width=True)
         else:
@@ -411,15 +478,18 @@ def show_adb_block(rom: str):
 
     return data
 
-
 # ----------------------------
-# Status UI + caching
+# Status cache (session) + helpers
 # ----------------------------
 def load_status_cache_once():
     if not st.session_state.status_cache_loaded:
-        st.session_state.status_cache = get_all_statuses()
+        try:
+            st.session_state.status_cache = get_all_statuses()
+        except Exception as e:
+            st.session_state.status_cache = {}
+            st.sidebar.error("Status storage unavailable.")
+            st.sidebar.caption(str(e))
         st.session_state.status_cache_loaded = True
-
 
 def status_for_rom(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
@@ -427,53 +497,18 @@ def status_for_rom(rom: str) -> str | None:
         return None
     return st.session_state.status_cache.get(rom)
 
-
 def update_status(rom: str, new_status: str | None):
     rom = (rom or "").strip().lower()
     if not rom:
         return
     set_status(rom, new_status)
-    # Update in-memory cache immediately
     if new_status is None:
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
 
-
 # ----------------------------
-# Export: Want to Play (.txt)
-# ----------------------------
-def build_want_to_play_txt(df: pd.DataFrame) -> str:
-    """
-    Build a plain-text export of Want to Play games.
-    One game per line, sorted by year then title.
-    """
-    want_roms = {
-        rom
-        for rom, status in st.session_state.status_cache.items()
-        if status == STATUS_WANT
-    }
-
-    if not want_roms:
-        return "No games marked as Want to Play."
-
-    subset = df[df["rom"].isin(want_roms)].copy()
-    subset = subset.sort_values(["year", "game"])
-
-    lines: list[str] = []
-    for _, row in subset.iterrows():
-        game = row.get("game", "")
-        year = row.get("year", "")
-        company = row.get("company", "")
-        genre = row.get("genre", "")
-        rom = row.get("rom", "")
-        lines.append(f"{game} ({year}) — {company} — {genre} — ROM: {rom}")
-
-    return "\n".join(lines)
-
-
-# ----------------------------
-# Details panel (streamlined) + statuses
+# Details panel (ROLLUP VERSION)
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -484,44 +519,33 @@ def show_game_details(row: pd.Series):
     rom = normalize_str(row.get("rom", "")).lower()
 
     cur_status = status_for_rom(rom)
-
-    # --- calm summary "card"
     st.markdown(f"## {g}")
-    st.caption(CABINET_SUMMARY)
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
+    st.caption(CABINET_SUMMARY)
 
-    if cur_status == STATUS_BLOCKED:
-        st.warning("This game is marked 🚫 Not playable and is hidden from discovery by default.")
-    elif cur_status == STATUS_NO_ROM:
-        st.info("This game is marked 🧩 Don't have ROM and is excluded from discovery by default.")
-
-    # Status controls (Want / Played / Don't have ROM / Not playable / Clear)
-    s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
-    with s1:
-        if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
+    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1.2, 1.2])
+    with b1:
+        if st.button("⏳ Want", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
             st.rerun()
-    with s2:
+    with b2:
         if st.button("✅ Played", use_container_width=True, key=f"st_played_{rom}"):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
-    with s3:
-        if st.button("🧩 Don't have ROM", use_container_width=True, key=f"st_norom_{rom}"):
+    with b3:
+        if st.button("🚫 Not playable", use_container_width=True, key=f"st_np_{rom}"):
+            update_status(rom, STATUS_NOT_PLAYABLE)
+            st.rerun()
+    with b4:
+        if st.button("📦 Don’t have ROM", use_container_width=True, key=f"st_norom_{rom}"):
             update_status(rom, STATUS_NO_ROM)
             st.rerun()
-    with s4:
-        if st.button("🚫 Not playable", use_container_width=True, key=f"st_block_{rom}"):
-            update_status(rom, STATUS_BLOCKED)
-            st.rerun()
-    with s5:
+    with b5:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
 
-    st.divider()
-
-    # --- progressive disclosure
-    with st.expander("📌 Quick facts", expanded=True):
+    with st.expander("📌 Basics", expanded=True):
         st.write(f"**Year:** {y}")
         if c:
             st.write(f"**Company:** {c}")
@@ -539,19 +563,11 @@ def show_game_details(row: pd.Series):
     with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
         show_adb_block(rom)
 
-
 # ----------------------------
 # Boot app
 # ----------------------------
 init_state()
-init_db()
-
-st.title("🕹️ Arcade Game Picker (1978–2008)")
-st.caption(
-    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Status (Want / Played / Don't have ROM / Not playable) is stored globally in a server-side SQLite DB."
-)
+init_persistence()
 
 # Load dataset (no caching)
 try:
@@ -564,72 +580,46 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
-# Load status cache once per session
 load_status_cache_once()
 
 # ----------------------------
-# Sidebar: streamlined core + advanced expander
+# Sidebar
 # ----------------------------
-st.sidebar.header("🎛️ Controls")
+st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
 
-# Core always-visible controls
-st.sidebar.subheader("Cabinet + Status")
+if USE_SUPABASE:
+    st.sidebar.success("Persistence: Supabase ✅")
+else:
+    st.sidebar.warning("Persistence: SQLite fallback ⚠️ (may reset on hosted sleep/restart)")
+
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.header("✅ Status filters")
+
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
+hide_not_playable = st.sidebar.toggle("Hide 🚫 Not playable", value=True)
+hide_no_rom = st.sidebar.toggle("Hide 📦 Don’t have ROM", value=False)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
-# NEW: show/hide excluded statuses
-show_blocked = st.sidebar.toggle("Show 🚫 Not playable", value=False)
-show_no_rom = st.sidebar.toggle("Show 🧩 Don't have ROM", value=False)
+st.sidebar.markdown("---")
+st.sidebar.header("Filters")
 
-# Export block (Want to Play)
-st.sidebar.divider()
-st.sidebar.subheader("Export")
-want_count = sum(1 for s in st.session_state.status_cache.values() if s == STATUS_WANT)
-txt_data = build_want_to_play_txt(df)
+years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
+platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
+genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
 
-st.sidebar.download_button(
-    label=f"📤 Export Want to Play ({want_count})",
-    data=txt_data,
-    file_name="arcade_want_to_play.txt",
-    mime="text/plain",
-    use_container_width=True,
-)
+platform_choice = st.sidebar.multiselect("Platform (optional)", platforms)
+genre_choice = st.sidebar.multiselect("Genre (optional)", genres)
 
-st.sidebar.divider()
-
-# Search moved to sidebar to reduce main clutter
-st.sidebar.subheader("Search")
-search_name = st.sidebar.text_input("Name or ROM", "")
-
-# Advanced filters collapsed
-with st.sidebar.expander("Advanced filters", expanded=False):
-    years = st.slider("Year range", 1978, 2008, (1978, 2008))
-
-    platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
-    genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
-
-    platform_choice = st.multiselect("Platform (optional)", platforms)
-    genre_choice = st.multiselect("Genre (optional)", genres)
-
-    st.caption("Tip: leave these empty most of the time—use Search + Random for fast discovery.")
-
-with st.sidebar.expander("Dataset info", expanded=False):
-    try:
-        p = Path(CSV_PATH)
-        st.caption(f"CSV rows: {len(df):,}")
-        st.caption(f"CSV modified (server): {datetime.fromtimestamp(p.stat().st_mtime)}")
-    except Exception:
-        st.caption("Dataset info unavailable.")
-
-# Default values if Advanced filters hasn't been opened yet
-if "years" not in locals():
-    years = (1978, 2008)
-if "platform_choice" not in locals():
-    platform_choice = []
-if "genre_choice" not in locals():
-    genre_choice = []
+st.sidebar.markdown("---")
+try:
+    p = Path(CSV_PATH)
+    st.sidebar.caption(f"CSV rows: {len(df):,}")
+    st.sidebar.caption(f"CSV modified (server): {datetime.fromtimestamp(p.stat().st_mtime)}")
+except Exception:
+    pass
 
 # ----------------------------
 # Build filtered view
@@ -644,28 +634,31 @@ if genre_choice:
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
-
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
 
-    # Hide excluded statuses unless explicitly shown
-    if (not show_blocked) and s == STATUS_BLOCKED:
-        return False
-    if (not show_no_rom) and s == STATUS_NO_ROM:
-        return False
-
     if only_want:
         return s == STATUS_WANT
+
     if hide_played and s == STATUS_PLAYED:
         return False
-    return True
+    if hide_not_playable and s == STATUS_NOT_PLAYABLE:
+        return False
+    if hide_no_rom and s == STATUS_NO_ROM:
+        return False
 
+    return True
 
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
 
-# Apply search
+# ----------------------------
+# Search
+# ----------------------------
+st.markdown("## 🔎 Search")
+search_name = st.text_input("Search by name or ROM (e.g., pacman, sf2, metal slug)", "")
+
 if search_name.strip():
     s = search_name.strip().lower()
     hits = base[
@@ -675,19 +668,23 @@ if search_name.strip():
 else:
     hits = base.copy()
 
+st.write(f"Matches: **{len(hits):,}**")
+st.divider()
+
 # ----------------------------
 # Two-panel layout
 # ----------------------------
 left, right = st.columns([1.15, 1.0], gap="large")
 
 with left:
-    st.subheader("🎲 Discover")
+    st.markdown("## 🎲 Discover (cabinet-ready)")
 
-    # Primary actions (always visible)
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3 = st.columns(3)
     with c1:
         pick_random = st.button("🎲 Random", use_container_width=True)
     with c2:
+        pick_10 = st.button("🎯 10 Picks", use_container_width=True)
+    with c3:
         clear_sel = st.button("🧹 Clear selection", use_container_width=True)
 
     if clear_sel:
@@ -695,21 +692,6 @@ with left:
         st.session_state.selected_key = None
         st.rerun()
 
-    # Game of the Day
-    st.markdown("#### 📆 Game of the Day")
-    now = datetime.now(TZ)
-    seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-
-    if len(hits) > 0:
-        gotd = hits.iloc[seed % len(hits)]
-        st.caption(f"Today: **{gotd['game']}** ({gotd['year']})")
-        if st.button("Open Game of the Day", use_container_width=True):
-            st.session_state.selected_key = game_key(gotd)
-            st.rerun()
-    else:
-        st.caption("No Game of the Day with current filters.")
-
-    # Random action
     if pick_random:
         if len(hits) == 0:
             st.warning("No games match your current cabinet + status filters. Widen filters.")
@@ -718,79 +700,82 @@ with left:
             st.session_state.selected_key = game_key(row)
             st.rerun()
 
-    st.divider()
-
-    # Secondary discovery (collapsed)
-    with st.expander("More ways to discover", expanded=True):
-        st.caption(f"Matches: **{len(hits):,}**")
-
-        c3, c4 = st.columns([1, 1])
-        with c3:
-            pick_10 = st.button("🎯 10 Picks", use_container_width=True)
-        with c4:
-            clear_picks = st.button("🧽 Clear 10 Picks", use_container_width=True)
-
-        if clear_picks:
-            st.session_state.picked_rows = []
+    if pick_10:
+        if len(hits) == 0:
+            st.warning("No games match your current cabinet + status filters. Widen filters.")
+        else:
+            n = min(10, len(hits))
+            sample = hits.sample(n).copy()
+            st.session_state.picked_rows = sample.to_dict("records")
+            st.session_state.selected_key = game_key(pd.Series(st.session_state.picked_rows[0]))
             st.rerun()
 
-        if pick_10:
-            if len(hits) == 0:
-                st.warning("No games match your current filters. Widen filters.")
-            else:
-                n = min(10, len(hits))
-                sample = hits.sample(n).copy()
-                st.session_state.picked_rows = sample.to_dict("records")
-                st.session_state.selected_key = game_key(pd.Series(st.session_state.picked_rows[0]))
-                st.rerun()
+    st.markdown("### 📆 Game of the Day")
 
-        st.markdown("##### 📜 Browse list")
-        view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
-        view["status"] = view["rom"].apply(
-            lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—")
+    # GOTD uses base pool (NOT search hits)
+    now = datetime.now(TZ)
+    seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
+    gotd_pool = base
+
+    if len(gotd_pool) > 0:
+        gotd_idx = seed % len(gotd_pool)
+        gotd = gotd_pool.iloc[gotd_idx]
+        st.caption(f"Today: {gotd['game']} ({gotd['year']})")
+        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool={len(gotd_pool)} idx={gotd_idx}")
+
+        if st.button("Open Game of the Day", use_container_width=True):
+            st.session_state.selected_key = game_key(gotd)
+            st.rerun()
+    else:
+        st.caption("No Game of the Day with current filters.")
+        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool=0 (widen filters)")
+
+    st.markdown("---")
+    st.markdown("## 📜 Browse list")
+
+    view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
+    view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
+
+    st.dataframe(view, use_container_width=True, height=420)
+
+    st.markdown("### Select a game")
+    if len(view) == 0:
+        st.info("No results to select. Adjust filters.")
+    else:
+        labels = (
+            view["game"].astype(str)
+            + " — "
+            + view["year"].astype(str)
+            + " — "
+            + view["company"].astype(str)
+            + " — "
+            + view["status"].astype(str)
         )
+        selected_label = st.selectbox("Pick from results", labels, key="browse_select")
+        idx = labels[labels == selected_label].index[0]
+        selected_row = view.loc[idx]
 
-        st.dataframe(view, use_container_width=True, height=360)
+        if st.button("➡️ Open selected", use_container_width=True):
+            st.session_state.selected_key = game_key(selected_row)
+            st.rerun()
 
-        st.markdown("##### Select a game")
-        if len(view) == 0:
-            st.info("No results to select. Adjust filters.")
-        else:
-            labels = (
-                view["game"].astype(str)
-                + " — "
-                + view["year"].astype(str)
-                + " — "
-                + view["company"].astype(str)
-                + " — "
-                + view["status"].astype(str)
-            )
-            selected_label = st.selectbox("Pick from results", labels, key="browse_select")
-            idx = labels[labels == selected_label].index[0]
-            selected_row = view.loc[idx]
+    if st.session_state.picked_rows:
+        st.markdown("---")
+        st.markdown("## 🎯 Your 10 picks")
+        pick_df = pd.DataFrame(st.session_state.picked_rows)
+        pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
+        pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
-            if st.button("➡️ Open selected", use_container_width=True):
-                st.session_state.selected_key = game_key(selected_row)
+        for i, r in pick_df.iterrows():
+            label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
+            if st.button(label, key=f"pick_{i}", use_container_width=True):
+                st.session_state.selected_key = game_key(r)
                 st.rerun()
-
-        if st.session_state.picked_rows:
-            st.markdown("##### 🎯 Your 10 picks")
-            pick_df = pd.DataFrame(st.session_state.picked_rows)
-            pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
-            pick_df["status"] = pick_df["rom"].apply(
-                lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—")
-            )
-
-            for i, r in pick_df.iterrows():
-                label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
-                if st.button(label, key=f"pick_{i}", use_container_width=True):
-                    st.session_state.selected_key = game_key(r)
-                    st.rerun()
 
 with right:
-    st.subheader("🧾 Details")
+    st.markdown("## 🧾 Details")
     if not st.session_state.selected_key:
-        st.info("Pick a game from the left (Random / Game of the Day / Browse) to see details.")
+        st.info("Pick a game from the list or hit Random/10 Picks to see details.")
     else:
         key = st.session_state.selected_key
 
@@ -802,7 +787,6 @@ with right:
             else:
                 show_game_details(match.iloc[0])
         else:
-            # meta fallback (rare)
             try:
                 _, meta = key.split("meta:", 1)
                 title, year_str, company = meta.split("|", 2)
