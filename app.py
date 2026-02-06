@@ -3,7 +3,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -18,93 +18,36 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Status (Want / Played / Not playable / Don't have ROM) is stored persistently in Supabase (with SQLite fallback)."
+    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand (optionally auto-load). "
+    "Status (Want to Play / Played) is stored globally in a server-side SQLite DB."
 )
 
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = (
-    "1.8.0 • Supabase persistence for status • GOTD uses base pool • "
-    "Details rollups • Strict Cabinet Mode • ADB on-demand • No CSV caching"
-)
+APP_VERSION = "1.7 • Strict Cabinet Mode • ADB on-demand/auto-load • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
-DB_PATH = "game_state.db"  # fallback only (local)
+DB_PATH = "game_state.db"
 
-# Status values
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
-STATUS_NOT_PLAYABLE = "not_playable"
-STATUS_NO_ROM = "dont_have_rom"
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
-    STATUS_NOT_PLAYABLE: "🚫 Not playable",
-    STATUS_NO_ROM: "📦 Don’t have ROM",
 }
 
 # ----------------------------
-# Supabase config (preferred persistence)
-# ----------------------------
-def _get_secret(name: str) -> str | None:
-    # Streamlit secrets preferred; fallback to env via st.secrets if present
-    try:
-        v = st.secrets.get(name)
-        if v is not None:
-            return str(v).strip()
-    except Exception:
-        pass
-    return None
-
-SUPABASE_URL = _get_secret("SUPABASE_URL")
-SUPABASE_KEY = _get_secret("SUPABASE_KEY")  # Anon key works if RLS policies allow; service role works without RLS.
-
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
-
-def _sb_url(path: str) -> str:
-    return f"{SUPABASE_URL.rstrip('/')}{path}"
-
-def supabase_request(method: str, path: str, params: dict | None = None, body: object | None = None, timeout_sec: int = 15):
-    """
-    Minimal PostgREST client using urllib (no extra deps).
-    """
-    if not USE_SUPABASE:
-        raise RuntimeError("Supabase not configured (missing SUPABASE_URL or SUPABASE_KEY).")
-
-    url = _sb_url(path)
-    if params:
-        url += "?" + urlencode(params)
-
-    data = None
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Accept": "application/json",
-    }
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    req = Request(url, data=data, method=method.upper(), headers=headers)
-    with urlopen(req, timeout=timeout_sec) as resp:
-        raw = resp.read()
-        text = raw.decode("utf-8", errors="replace").strip()
-        if not text:
-            return None
-        return json.loads(text)
-
-# ----------------------------
-# SQLite fallback (only used if Supabase not configured)
+# DB (global state across devices)
 # ----------------------------
 def get_db() -> sqlite3.Connection:
+    # check_same_thread False is fine for Streamlit single-process usage
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def init_db_sqlite() -> None:
+def init_db() -> None:
     conn = get_db()
     conn.execute(
         """
@@ -118,7 +61,10 @@ def init_db_sqlite() -> None:
     conn.commit()
     conn.close()
 
-def get_all_statuses_sqlite() -> dict[str, str]:
+def get_all_statuses() -> dict[str, str]:
+    """
+    Returns mapping: rom -> status
+    """
     conn = get_db()
     cur = conn.execute("SELECT rom, status FROM game_status")
     rows = cur.fetchall()
@@ -129,7 +75,17 @@ def get_all_statuses_sqlite() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
-def set_status_sqlite(rom: str, status: str | None) -> None:
+def get_status(rom: str) -> str | None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return None
+    conn = get_db()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
@@ -149,66 +105,6 @@ def set_status_sqlite(rom: str, status: str | None) -> None:
         )
     conn.commit()
     conn.close()
-
-# ----------------------------
-# Status persistence (Supabase preferred)
-# Table expected in Supabase:
-#   game_status(rom text primary key, status text, updated_at timestamptz default now())
-# ----------------------------
-def init_persistence() -> None:
-    """
-    No-op for Supabase (table should already exist).
-    For SQLite fallback, create local table.
-    """
-    if not USE_SUPABASE:
-        init_db_sqlite()
-
-def get_all_statuses() -> dict[str, str]:
-    """
-    Returns mapping: rom -> status
-    """
-    if USE_SUPABASE:
-        # GET /rest/v1/game_status?select=rom,status
-        data = supabase_request("GET", "/rest/v1/game_status", params={"select": "rom,status"})
-        out = {}
-        if isinstance(data, list):
-            for row in data:
-                rom = (row.get("rom") or "").strip().lower()
-                status = row.get("status")
-                if rom:
-                    out[rom] = status
-        return out
-    return get_all_statuses_sqlite()
-
-def set_status(rom: str, status: str | None) -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-
-    if USE_SUPABASE:
-        if status is None:
-            # DELETE /rest/v1/game_status?rom=eq.<rom>
-            supabase_request("DELETE", "/rest/v1/game_status", params={"rom": f"eq.{rom}"})
-            return
-
-        # UPSERT:
-        # POST /rest/v1/game_status?on_conflict=rom
-        # Prefer: resolution=merge-duplicates
-        url = _sb_url("/rest/v1/game_status") + "?" + urlencode({"on_conflict": "rom"})
-        body = {"rom": rom, "status": status}
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates,return=minimal",
-        }
-        req = Request(url, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
-        with urlopen(req, timeout=15) as resp:
-            resp.read()
-        return
-
-    set_status_sqlite(rom, status)
 
 # ----------------------------
 # Helpers: normalization / dataset
@@ -272,12 +168,19 @@ def init_state():
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
 
+    # NEW: ADB auto-load preferences
+    if "adb_autoload_global" not in st.session_state:
+        st.session_state.adb_autoload_global = False
+    if "adb_autoload_by_rom" not in st.session_state:
+        # rom -> bool
+        st.session_state.adb_autoload_by_rom = {}
+
 # ----------------------------
 # Cabinet profile + strict compatibility
 # ----------------------------
 CABINET_SUMMARY = (
-    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, 6 buttons/player, "
-    "NO spinner/trackball/lightgun/wheel, horizontal monitor (vertical OK)."
+    "Your cabinet: 4-way stick + 8-way stick, 6 buttons/player, NO spinner/trackball/lightgun/wheel, "
+    "horizontal monitor (vertical OK)."
 )
 
 BLOCKED_GENRE_EXACT = {
@@ -334,20 +237,19 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     return True
 
 # ----------------------------
-# ADB (ArcadeItalia) on-demand integration
+# ADB (ArcadeItalia) on-demand integration (HTTP-only)
 # ----------------------------
 def adb_urls(rom: str):
+    """
+    HTTP-only as requested.
+    """
     rom = (rom or "").strip().lower()
-    page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
     page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
 
     params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
-    scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
     scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
     return {
-        "page_https": page_https,
         "page_http": page_http,
-        "scraper_https": scraper_https,
         "scraper_http": scraper_http,
     }
 
@@ -355,7 +257,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.8; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.7; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -377,13 +279,12 @@ def fetch_adb_details(rom: str) -> dict:
 
     urls = adb_urls(rom)
     last_err = None
-    for u in (urls["scraper_https"], urls["scraper_http"]):
-        try:
-            data = fetch_json_url(u, timeout_sec=12)
-            st.session_state.adb_cache[rom] = data
-            return data
-        except Exception as e:
-            last_err = str(e)
+    try:
+        data = fetch_json_url(urls["scraper_http"], timeout_sec=12)
+        st.session_state.adb_cache[rom] = data
+        return data
+    except Exception as e:
+        last_err = str(e)
 
     out = {
         "_error": "Could not retrieve data from ADB right now.",
@@ -407,6 +308,10 @@ def extract_image_urls(obj) -> list[str]:
         elif isinstance(x, str):
             s = x.strip()
             if s.startswith("http://") or s.startswith("https://"):
+                # If ADB returns https links to itself, rewrite to http to stay consistent
+                if s.startswith("https://adb.arcadeitalia.net/"):
+                    s = "http://adb.arcadeitalia.net/" + s.split("https://adb.arcadeitalia.net/", 1)[1]
+
                 if re.search(r"\.(png|jpg|jpeg|webp)(\?.*)?$", s, re.IGNORECASE):
                     urls.append(s)
 
@@ -420,6 +325,17 @@ def extract_image_urls(obj) -> list[str]:
             out.append(u)
     return out
 
+def adb_autoload_effective(rom: str) -> bool:
+    """
+    Per-game overrides global default if set.
+    """
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return False
+    if rom in st.session_state.adb_autoload_by_rom:
+        return bool(st.session_state.adb_autoload_by_rom[rom])
+    return bool(st.session_state.adb_autoload_global)
+
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
     if not rom:
@@ -427,9 +343,20 @@ def show_adb_block(rom: str):
         return None
 
     urls = adb_urls(rom)
-    st.markdown("**ADB links:**")
-    st.write(f"- ADB page (HTTPS): {urls['page_https']}")
-    st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
+
+    # NEW: per-game auto-load toggle (defaulted from global unless overridden)
+    current_auto = adb_autoload_effective(rom)
+    auto_val = st.toggle(
+        "Auto-load ADB for this game",
+        value=current_auto,
+        key=f"adb_autoload_{rom}",
+        help="If enabled, ADB details will fetch automatically when you open this game (unless already cached).",
+    )
+    # Persist per-game preference as an explicit override
+    st.session_state.adb_autoload_by_rom[rom] = bool(auto_val)
+
+    st.markdown("**ADB link (HTTP):**")
+    st.write(f"- ADB page: {urls['page_http']}")
 
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
@@ -442,7 +369,15 @@ def show_adb_block(rom: str):
     if refresh_btn and rom in st.session_state.adb_cache:
         del st.session_state.adb_cache[rom]
 
-    if not load_btn and not refresh_btn:
+    # Decide whether to fetch:
+    # - Manual load button OR refresh triggers fetch
+    # - Auto-load triggers fetch when not cached (or cached error)
+    should_autoload_now = bool(auto_val) and (
+        rom not in st.session_state.adb_cache or bool(st.session_state.adb_cache.get(rom, {}).get("_error"))
+    )
+
+    if not load_btn and not refresh_btn and not should_autoload_now:
+        # If already cached (and not error), show it without refetching
         if rom in st.session_state.adb_cache and not st.session_state.adb_cache[rom].get("_error"):
             data = st.session_state.adb_cache[rom]
         else:
@@ -458,7 +393,18 @@ def show_adb_block(rom: str):
         return data
 
     st.subheader("ADB Details (summary)")
-    for k in ("title", "description", "manufacturer", "year", "genre", "players", "buttons", "controls", "rotation", "status"):
+    for k in (
+        "title",
+        "description",
+        "manufacturer",
+        "year",
+        "genre",
+        "players",
+        "buttons",
+        "controls",
+        "rotation",
+        "status",
+    ):
         if k in data and data[k]:
             val = data[k]
             if isinstance(val, (dict, list)):
@@ -479,16 +425,11 @@ def show_adb_block(rom: str):
     return data
 
 # ----------------------------
-# Status cache (session) + helpers
+# Status UI + caching
 # ----------------------------
 def load_status_cache_once():
     if not st.session_state.status_cache_loaded:
-        try:
-            st.session_state.status_cache = get_all_statuses()
-        except Exception as e:
-            st.session_state.status_cache = {}
-            st.sidebar.error("Status storage unavailable.")
-            st.sidebar.caption(str(e))
+        st.session_state.status_cache = get_all_statuses()
         st.session_state.status_cache_loaded = True
 
 def status_for_rom(rom: str) -> str | None:
@@ -502,13 +443,14 @@ def update_status(rom: str, new_status: str | None):
     if not rom:
         return
     set_status(rom, new_status)
+    # Update in-memory cache immediately
     if new_status is None:
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
 
 # ----------------------------
-# Details panel (ROLLUP VERSION)
+# Details panel
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -518,56 +460,49 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
+    # Status controls
     cur_status = status_for_rom(rom)
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
-    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1.2, 1.2])
-    with b1:
-        if st.button("⏳ Want", use_container_width=True, key=f"st_want_{rom}"):
+    s1, s2, s3 = st.columns([1, 1, 1])
+    with s1:
+        if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
             st.rerun()
-    with b2:
+    with s2:
         if st.button("✅ Played", use_container_width=True, key=f"st_played_{rom}"):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
-    with b3:
-        if st.button("🚫 Not playable", use_container_width=True, key=f"st_np_{rom}"):
-            update_status(rom, STATUS_NOT_PLAYABLE)
-            st.rerun()
-    with b4:
-        if st.button("📦 Don’t have ROM", use_container_width=True, key=f"st_norom_{rom}"):
-            update_status(rom, STATUS_NO_ROM)
-            st.rerun()
-    with b5:
+    with s3:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
 
-    with st.expander("📌 Basics", expanded=True):
-        st.write(f"**Year:** {y}")
-        if c:
-            st.write(f"**Company:** {c}")
-        if genre:
-            st.write(f"**Genre:** {genre}")
-        if platform:
-            st.write(f"**Platform:** {platform}")
-        if rom:
-            st.write(f"**ROM (MAME short name):** `{rom}`")
+    st.write(f"**Year:** {y}")
+    if c:
+        st.write(f"**Company:** {c}")
+    if genre:
+        st.write(f"**Genre:** {genre}")
+    if platform:
+        st.write(f"**Platform:** {platform}")
+    if rom:
+        st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    with st.expander("🔗 Research links", expanded=False):
-        for name, url in build_links(g).items():
-            st.write(f"- {name}: {url}")
+    st.markdown("### 🔗 Research links")
+    for name, url in build_links(g).items():
+        st.write(f"- {name}: {url}")
 
-    with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
-        show_adb_block(rom)
+    st.markdown("---")
+    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand / optional auto-load)")
+    show_adb_block(rom)
 
 # ----------------------------
 # Boot app
 # ----------------------------
 init_state()
-init_persistence()
+init_db()
 
 # Load dataset (no caching)
 try:
@@ -580,27 +515,30 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
+# Load status cache once per session (global data)
 load_status_cache_once()
 
 # ----------------------------
-# Sidebar
+# Sidebar: Cabinet mode + status filtering
 # ----------------------------
 st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
 
-if USE_SUPABASE:
-    st.sidebar.success("Persistence: Supabase ✅")
-else:
-    st.sidebar.warning("Persistence: SQLite fallback ⚠️ (may reset on hosted sleep/restart)")
-
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.header("📚 ADB (ArcadeItalia)")
+st.sidebar.toggle(
+    "Auto-load ADB details when opening a game (global default)",
+    value=st.session_state.adb_autoload_global,
+    key="adb_autoload_global",
+    help="Sets the default. You can override per-game inside the ADB expander.",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("✅ Status filters")
 
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
-hide_not_playable = st.sidebar.toggle("Hide 🚫 Not playable", value=True)
-hide_no_rom = st.sidebar.toggle("Hide 📦 Don’t have ROM", value=False)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
 st.sidebar.markdown("---")
@@ -634,20 +572,14 @@ if genre_choice:
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
+# Apply status filters
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
-
     if only_want:
         return s == STATUS_WANT
-
     if hide_played and s == STATUS_PLAYED:
         return False
-    if hide_not_playable and s == STATUS_NOT_PLAYABLE:
-        return False
-    if hide_no_rom and s == STATUS_NO_ROM:
-        return False
-
     return True
 
 base = base[base.apply(keep_by_status, axis=1)].copy()
@@ -694,7 +626,7 @@ with left:
 
     if pick_random:
         if len(hits) == 0:
-            st.warning("No games match your current cabinet + status filters. Widen filters.")
+            st.warning("No games match your current strict cabinet + status filters. Widen filters.")
         else:
             row = hits.sample(1).iloc[0]
             st.session_state.selected_key = game_key(row)
@@ -702,7 +634,7 @@ with left:
 
     if pick_10:
         if len(hits) == 0:
-            st.warning("No games match your current cabinet + status filters. Widen filters.")
+            st.warning("No games match your current strict cabinet + status filters. Widen filters.")
         else:
             n = min(10, len(hits))
             sample = hits.sample(n).copy()
@@ -711,28 +643,21 @@ with left:
             st.rerun()
 
     st.markdown("### 📆 Game of the Day")
-
-    # GOTD uses base pool (NOT search hits)
     now = datetime.now(TZ)
     seed = int(now.strftime("%Y")) * 1000 + int(now.strftime("%j"))
-    gotd_pool = base
-
-    if len(gotd_pool) > 0:
-        gotd_idx = seed % len(gotd_pool)
-        gotd = gotd_pool.iloc[gotd_idx]
+    if len(hits) > 0:
+        gotd = hits.iloc[seed % len(hits)]
         st.caption(f"Today: {gotd['game']} ({gotd['year']})")
-        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool={len(gotd_pool)} idx={gotd_idx}")
-
         if st.button("Open Game of the Day", use_container_width=True):
             st.session_state.selected_key = game_key(gotd)
             st.rerun()
     else:
         st.caption("No Game of the Day with current filters.")
-        st.caption(f"Debug GOTD: date={now.strftime('%Y-%m-%d')} seed={seed} pool=0 (widen filters)")
 
     st.markdown("---")
     st.markdown("## 📜 Browse list")
 
+    # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
     view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
 
@@ -787,6 +712,7 @@ with right:
             else:
                 show_game_details(match.iloc[0])
         else:
+            # meta fallback (rare)
             try:
                 _, meta = key.split("meta:", 1)
                 title, year_str, company = meta.split("|", 2)
