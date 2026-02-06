@@ -400,6 +400,7 @@ def parse_adb_summary(data: dict) -> tuple[dict, dict]:
     return summary, {"extracted_paths": paths, "wrap_candidates": [type(x).__name__ for x in candidates]}
 
 
+
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
     if not rom:
@@ -471,22 +472,55 @@ def show_adb_block(rom: str):
                     label = k.replace("_", " ").title()
                     st.write(f"**{label}:** {summary[k]}")
         else:
-            st.warning("ADB returned data but no recognizable fields were found. Showing raw response.")
+            st.warning("ADB returned data but no recognizable fields were found.")
 
-        with st.expander("ADB parse debug (paths used)", expanded=False):
+        # ---- No nested expanders! Use tabs instead. ----
+        tab_art, tab_debug, tab_raw = st.tabs(["🖼️ Artwork", "🧩 Parse debug", "🧾 Raw JSON"])
+
+        with tab_art:
+            if not show_images:
+                st.caption("Artwork display is turned off.")
+            else:
+                imgs = extract_image_urls(data)
+
+                # If ADB returns image links without obvious extensions, keep a few additional candidates
+                # (ADB commonly serves media under /media/ and sometimes uses query strings).
+                if not imgs:
+                    extra = []
+                    for _, k, v in _walk_kv(data):
+                        if isinstance(v, str):
+                            s = v.strip()
+                            if "adb.arcadeitalia.net" in s and ("/media/" in s or "media" in s.lower()):
+                                if s.startswith("https://adb.arcadeitalia.net/"):
+                                    s = "http://adb.arcadeitalia.net/" + s.split("https://adb.arcadeitalia.net/", 1)[1]
+                                if s.startswith("//adb.arcadeitalia.net/"):
+                                    s = "http:" + s
+                                if s.startswith("http://adb.arcadeitalia.net/") or s.startswith("https://adb.arcadeitalia.net/"):
+                                    extra.append(s)
+                    # de-dupe while preserving order
+                    seen = set()
+                    imgs = []
+                    for u in extra:
+                        if u not in seen:
+                            seen.add(u)
+                            imgs.append(u)
+
+                if imgs:
+                    st.caption(f"Found {len(imgs)} image URL(s). Showing up to 12.")
+                    for u in imgs[:12]:
+                        try:
+                            st.image(u, use_container_width=True)
+                        except Exception as e:
+                            st.warning(f"Could not render image: {u}")
+                            st.caption(str(e))
+                else:
+                    st.caption("No image URLs found in the ADB response for this title.")
+
+        with tab_debug:
             st.json(dbg)
 
-        with st.expander("Raw ADB response (JSON)", expanded=False):
+        with tab_raw:
             st.json(data)
-
-        if show_images:
-            imgs = extract_image_urls(data)
-            if imgs:
-                st.subheader("Artwork / Images")
-                for u in imgs[:10]:
-                    st.image(u, use_container_width=True)
-            else:
-                st.caption("No direct image URLs found in the ADB response for this title.")
 
         return data
 
