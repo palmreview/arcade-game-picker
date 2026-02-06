@@ -592,13 +592,30 @@ def show_game_details(row: pd.Series):
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    st.markdown("### 🔗 Research links")
-    for name, url in build_links(g).items():
-        st.write(f"- {name}: {url}")
-
-    st.markdown("---")
     st.markdown("### 📚 Arcade Database (ADB) (HTTP-only, on-demand / optional auto-load)")
     show_adb_block(rom)
+
+    # ----------------------------
+    # Research links (rolled-up with dropdown)
+    # ----------------------------
+    st.markdown("---")
+    st.markdown("### 🔎 Research")
+
+    links = build_links(g)
+    # A small "rolled-up" UI: pick one link at a time
+    link_names = ["— Select a research link —"] + list(links.keys())
+    choice = st.selectbox("Research links", link_names, key=f"research_dd_{rom or g}")
+
+    if choice and choice != "— Select a research link —":
+        url = links.get(choice, "")
+        if url:
+            # Streamlit link_button is nicer when available; fall back to markdown if not.
+            if hasattr(st, "link_button"):
+                st.link_button(f"Open: {choice}", url, use_container_width=True)
+            else:
+                st.markdown(f"[Open: {choice}]({url})")
+        else:
+            st.info("No URL found for this selection.")
 
 
 # ----------------------------
