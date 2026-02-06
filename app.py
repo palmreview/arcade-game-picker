@@ -47,6 +47,7 @@ def get_db() -> sqlite3.Connection:
     # check_same_thread False is fine for Streamlit single-process usage
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+
 def init_db() -> None:
     conn = get_db()
     conn.execute(
@@ -60,6 +61,7 @@ def init_db() -> None:
     )
     conn.commit()
     conn.close()
+
 
 def get_all_statuses() -> dict[str, str]:
     """
@@ -75,6 +77,7 @@ def get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
+
 def get_status(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
     if not rom:
@@ -84,6 +87,7 @@ def get_status(rom: str) -> str | None:
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
@@ -106,6 +110,7 @@ def set_status(rom: str, status: str | None) -> None:
     conn.commit()
     conn.close()
 
+
 # ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
@@ -113,6 +118,7 @@ def normalize_str(x) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
+
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["rom", "game", "year", "company", "genre", "platform"]:
@@ -136,9 +142,11 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
+
 
 def build_links(game_name: str):
     q = game_name.replace(" ", "+")
@@ -150,11 +158,13 @@ def build_links(game_name: str):
         "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
     }
 
+
 def game_key(row: pd.Series) -> str:
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
     return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
+
 
 def init_state():
     if "picked_rows" not in st.session_state:
@@ -168,12 +178,13 @@ def init_state():
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
 
-    # NEW: ADB auto-load preferences
+    # ADB auto-load preferences
     if "adb_autoload_global" not in st.session_state:
         st.session_state.adb_autoload_global = False
     if "adb_autoload_by_rom" not in st.session_state:
         # rom -> bool
         st.session_state.adb_autoload_by_rom = {}
+
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -212,6 +223,7 @@ BLOCKED_TITLE_HINTS = [
     "paddle",
 ]
 
+
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -236,6 +248,7 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 
     return True
 
+
 # ----------------------------
 # ADB (ArcadeItalia) on-demand integration (HTTP-only)
 # ----------------------------
@@ -253,6 +266,7 @@ def adb_urls(rom: str):
         "scraper_http": scraper_http,
     }
 
+
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
@@ -268,6 +282,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     if isinstance(data, dict):
         return data
     return {"_data": data}
+
 
 def fetch_adb_details(rom: str) -> dict:
     rom = (rom or "").strip().lower()
@@ -295,6 +310,7 @@ def fetch_adb_details(rom: str) -> dict:
     st.session_state.adb_cache[rom] = out
     return out
 
+
 def extract_image_urls(obj) -> list[str]:
     urls = []
 
@@ -308,7 +324,7 @@ def extract_image_urls(obj) -> list[str]:
         elif isinstance(x, str):
             s = x.strip()
             if s.startswith("http://") or s.startswith("https://"):
-                # If ADB returns https links to itself, rewrite to http to stay consistent
+                # rewrite ADB https links to http to stay consistent
                 if s.startswith("https://adb.arcadeitalia.net/"):
                     s = "http://adb.arcadeitalia.net/" + s.split("https://adb.arcadeitalia.net/", 1)[1]
 
@@ -325,6 +341,7 @@ def extract_image_urls(obj) -> list[str]:
             out.append(u)
     return out
 
+
 def adb_autoload_effective(rom: str) -> bool:
     """
     Per-game overrides global default if set.
@@ -336,6 +353,7 @@ def adb_autoload_effective(rom: str) -> bool:
         return bool(st.session_state.adb_autoload_by_rom[rom])
     return bool(st.session_state.adb_autoload_global)
 
+
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
     if not rom:
@@ -344,85 +362,108 @@ def show_adb_block(rom: str):
 
     urls = adb_urls(rom)
 
-    # NEW: per-game auto-load toggle (defaulted from global unless overridden)
-    current_auto = adb_autoload_effective(rom)
-    auto_val = st.toggle(
-        "Auto-load ADB for this game",
-        value=current_auto,
-        key=f"adb_autoload_{rom}",
-        help="If enabled, ADB details will fetch automatically when you open this game (unless already cached).",
-    )
-    # Persist per-game preference as an explicit override
-    st.session_state.adb_autoload_by_rom[rom] = bool(auto_val)
+    with st.expander("ADB details + artwork", expanded=False):
+        # per-game auto-load toggle (defaulted from global unless overridden)
+        current_auto = adb_autoload_effective(rom)
+        auto_val = st.toggle(
+            "Auto-load ADB for this game",
+            value=current_auto,
+            key=f"adb_autoload_{rom}",
+            help="If enabled, ADB details will fetch automatically when you open this game (unless already cached).",
+        )
+        # Persist per-game preference as an explicit override
+        st.session_state.adb_autoload_by_rom[rom] = bool(auto_val)
 
-    st.markdown("**ADB link (HTTP):**")
-    st.write(f"- ADB page: {urls['page_http']}")
+        st.markdown("**ADB links (HTTP-only):**")
+        st.write(f"- ADB page: {urls['page_http']}")
+        st.write(f"- Scraper (HTTP): {urls['scraper_http']}")
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
-    with c2:
-        refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
-    with c3:
-        show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
+        with c2:
+            refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
+        with c3:
+            show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
 
-    if refresh_btn and rom in st.session_state.adb_cache:
-        del st.session_state.adb_cache[rom]
+        if refresh_btn and rom in st.session_state.adb_cache:
+            del st.session_state.adb_cache[rom]
 
-    # Decide whether to fetch:
-    # - Manual load button OR refresh triggers fetch
-    # - Auto-load triggers fetch when not cached (or cached error)
-    should_autoload_now = bool(auto_val) and (
-        rom not in st.session_state.adb_cache or bool(st.session_state.adb_cache.get(rom, {}).get("_error"))
-    )
+        # Decide whether to fetch
+        should_autoload_now = bool(auto_val) and (
+            rom not in st.session_state.adb_cache
+            or bool(st.session_state.adb_cache.get(rom, {}).get("_error"))
+        )
 
-    if not load_btn and not refresh_btn and not should_autoload_now:
-        # If already cached (and not error), show it without refetching
-        if rom in st.session_state.adb_cache and not st.session_state.adb_cache[rom].get("_error"):
-            data = st.session_state.adb_cache[rom]
-        else:
+        # If nothing has been fetched yet, don't be silent
+        if (rom not in st.session_state.adb_cache) and (not load_btn) and (not refresh_btn) and (not should_autoload_now):
+            st.info("ADB is not loaded yet. Click **📥 Load ADB details** (or enable **Auto-load** above).")
             return None
-    else:
-        with st.spinner("Fetching from ADB..."):
-            data = fetch_adb_details(rom)
 
-    if isinstance(data, dict) and data.get("_error"):
-        st.error(data["_error"])
-        if data.get("_detail"):
-            st.caption(f"Details: {data['_detail']}")
+        # Fetch or reuse cached
+        if load_btn or refresh_btn or should_autoload_now:
+            with st.spinner("Fetching from ADB..."):
+                data = fetch_adb_details(rom)
+        else:
+            data = st.session_state.adb_cache.get(rom)
+
+        if not isinstance(data, dict):
+            st.warning("ADB returned an unexpected response format.")
+            st.json(data)
+            return data
+
+        if data.get("_error"):
+            st.error(data["_error"])
+            if data.get("_detail"):
+                st.caption(f"Details: {data['_detail']}")
+            if data.get("_fallback_page"):
+                st.write(f"Try opening the ADB page directly: {data['_fallback_page']}")
+            return data
+
+        # Try to show a friendly summary if keys exist
+        st.subheader("ADB Details")
+        summary_keys = [
+            "title",
+            "description",
+            "manufacturer",
+            "year",
+            "genre",
+            "players",
+            "buttons",
+            "controls",
+            "rotation",
+            "status",
+        ]
+
+        found_any = False
+        for k in summary_keys:
+            if k in data and data[k]:
+                found_any = True
+                val = data[k]
+                if isinstance(val, (dict, list)):
+                    st.write(f"**{k}:**")
+                    st.json(val)
+                else:
+                    st.write(f"**{k}:** {val}")
+
+        # If response doesn't match expected keys, show raw JSON so it isn't "blank"
+        if not found_any:
+            st.warning(
+                "ADB returned data, but not in the expected flat fields. Showing the raw response below (useful for debugging)."
+            )
+            st.json(data)
+
+        if show_images:
+            imgs = extract_image_urls(data)
+            if imgs:
+                st.subheader("Artwork / Images")
+                for u in imgs[:10]:
+                    st.image(u, use_container_width=True)
+            else:
+                st.caption("No direct image URLs found in the ADB response for this title.")
+
         return data
 
-    st.subheader("ADB Details (summary)")
-    for k in (
-        "title",
-        "description",
-        "manufacturer",
-        "year",
-        "genre",
-        "players",
-        "buttons",
-        "controls",
-        "rotation",
-        "status",
-    ):
-        if k in data and data[k]:
-            val = data[k]
-            if isinstance(val, (dict, list)):
-                st.write(f"**{k}:**")
-                st.json(val)
-            else:
-                st.write(f"**{k}:** {val}")
-
-    if show_images:
-        imgs = extract_image_urls(data)
-        if imgs:
-            st.subheader("Artwork / Images")
-            for u in imgs[:10]:
-                st.image(u, use_container_width=True)
-        else:
-            st.caption("No direct image URLs found in the ADB response for this title.")
-
-    return data
 
 # ----------------------------
 # Status UI + caching
@@ -432,11 +473,13 @@ def load_status_cache_once():
         st.session_state.status_cache = get_all_statuses()
         st.session_state.status_cache_loaded = True
 
+
 def status_for_rom(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
     if not rom:
         return None
     return st.session_state.status_cache.get(rom)
+
 
 def update_status(rom: str, new_status: str | None):
     rom = (rom or "").strip().lower()
@@ -448,6 +491,7 @@ def update_status(rom: str, new_status: str | None):
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
+
 
 # ----------------------------
 # Details panel
@@ -495,8 +539,9 @@ def show_game_details(row: pd.Series):
         st.write(f"- {name}: {url}")
 
     st.markdown("---")
-    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand / optional auto-load)")
+    st.markdown("### 📚 Arcade Database (ADB) (HTTP-only, on-demand / optional auto-load)")
     show_adb_block(rom)
+
 
 # ----------------------------
 # Boot app
@@ -581,6 +626,7 @@ def keep_by_status(row: pd.Series) -> bool:
     if hide_played and s == STATUS_PLAYED:
         return False
     return True
+
 
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
