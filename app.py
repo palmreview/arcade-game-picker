@@ -22,19 +22,19 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 TZ = ZoneInfo("America/New_York")
 
 APP_VERSION = (
-    "1.11 • Pass-1 UI Streamline + Want Export + Not Playable + Don't Have ROM + Marquees (R2) • "
-    "Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+    "1.12 • Pass-1 UI Streamline + Want Export + Not Playable + Don't Have ROM + Marquees (R2) • "
+    "Fix: st.image uses use_column_width • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 )
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
 
 # --- Cloudflare R2 Public Development URL (r2.dev)
-# Your objects are expected at:
+# Objects expected at:
 #   {R2_PUBLIC_ROOT}/marquees/<rom>.png
 #   {R2_PUBLIC_ROOT}/marquees/default.png
 R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
-MARQUEE_PATH_PREFIX = "marquees"  # folder in bucket
+MARQUEE_PATH_PREFIX = "marquees"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
@@ -214,7 +214,6 @@ def init_state():
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
     if "marquee_exists_cache" not in st.session_state:
-        # rom -> True/False
         st.session_state.marquee_exists_cache = {}
 
 
@@ -269,7 +268,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.11; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.12; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -401,7 +400,7 @@ def show_adb_block(rom: str):
         if imgs:
             st.markdown("#### Artwork / Images")
             for u in imgs[:10]:
-                st.image(u, use_container_width=True)
+                st.image(u, use_column_width=True)  # FIXED
         else:
             st.caption("No direct image URLs found in the ADB response for this title.")
 
@@ -440,7 +439,6 @@ def update_status(rom: str, new_status: str | None):
 # ----------------------------
 def build_want_to_play_txt(df: pd.DataFrame) -> str:
     want_roms = {rom for rom, status in st.session_state.status_cache.items() if status == STATUS_WANT}
-
     if not want_roms:
         return "No games marked as Want to Play."
 
@@ -474,25 +472,16 @@ def default_marquee_url() -> str:
 
 
 def url_exists(url: str, timeout_sec: int = 4) -> bool:
-    """
-    Lightweight existence check. Uses a small ranged GET so we don't download the whole image.
-    Many object stores don't reliably support HEAD in all cases; this works broadly.
-    """
     try:
         req = Request(
             url,
             method="GET",
-            headers={
-                "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.11)",
-                "Range": "bytes=0-0",
-            },
+            headers={"User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.12)", "Range": "bytes=0-0"},
         )
         with urlopen(req, timeout=timeout_sec) as resp:
             code = getattr(resp, "status", 200)
             return 200 <= int(code) < 400
     except HTTPError as e:
-        if e.code in (404, 403):
-            return False
         return False
     except URLError:
         return False
@@ -501,13 +490,9 @@ def url_exists(url: str, timeout_sec: int = 4) -> bool:
 
 
 def show_marquee(rom: str):
-    """
-    Show marquee for a ROM if it exists, otherwise show default.png.
-    Caches existence per ROM for the session.
-    """
     rom = (rom or "").strip().lower()
     if not rom:
-        st.image(default_marquee_url(), use_container_width=True)
+        st.image(default_marquee_url(), use_column_width=True)  # FIXED
         return
 
     cache = st.session_state.marquee_exists_cache
@@ -515,13 +500,13 @@ def show_marquee(rom: str):
         cache[rom] = url_exists(marquee_url(rom), timeout_sec=4)
 
     if cache.get(rom):
-        st.image(marquee_url(rom), use_container_width=True)
+        st.image(marquee_url(rom), use_column_width=True)  # FIXED
     else:
-        st.image(default_marquee_url(), use_container_width=True)
+        st.image(default_marquee_url(), use_column_width=True)  # FIXED
 
 
 # ----------------------------
-# Details panel (streamlined) + statuses + marquee
+# Details panel
 # ----------------------------
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
@@ -531,7 +516,6 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
-    # Marquee at top
     show_marquee(rom)
 
     cur_status = status_for_rom(rom)
@@ -545,7 +529,6 @@ def show_game_details(row: pd.Series):
     elif cur_status == STATUS_NO_ROM:
         st.info("This game is marked 🧩 Don't have ROM and is excluded from discovery by default.")
 
-    # Status controls
     s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
@@ -590,7 +573,7 @@ def show_game_details(row: pd.Series):
 
 
 # ----------------------------
-# Boot app
+# Boot
 # ----------------------------
 init_state()
 init_db()
@@ -598,11 +581,10 @@ init_db()
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "ADB details/artwork load on-demand. Status is stored globally in a server-side SQLite DB. "
+    "ADB details/artwork load on-demand. Status is stored globally in SQLite. "
     "Marquees load from Cloudflare R2 (r2.dev)."
 )
 
-# Load dataset (no caching)
 try:
     df = load_games_no_cache()
 except FileNotFoundError:
@@ -613,12 +595,9 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
-# Load status cache once per session
 load_status_cache_once()
 
-# ----------------------------
-# Sidebar: streamlined core + advanced expander
-# ----------------------------
+# Sidebar
 st.sidebar.header("🎛️ Controls")
 st.sidebar.caption(APP_VERSION)
 
@@ -648,13 +627,10 @@ search_name = st.sidebar.text_input("Name or ROM", "")
 
 with st.sidebar.expander("Advanced filters", expanded=False):
     years = st.slider("Year range", 1978, 2008, (1978, 2008))
-
     platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
     genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
-
     platform_choice = st.multiselect("Platform (optional)", platforms)
     genre_choice = st.multiselect("Genre (optional)", genres)
-
     st.caption("Tip: leave these empty most of the time—use Search + Random for fast discovery.")
 
 with st.sidebar.expander("Dataset info", expanded=False):
@@ -666,16 +642,12 @@ with st.sidebar.expander("Dataset info", expanded=False):
         st.caption("Dataset info unavailable.")
 
 
-# ----------------------------
 # Build filtered view
-# ----------------------------
 base = df[(df["year"] >= years[0]) & (df["year"] <= years[1])].copy()
-
 if platform_choice:
     base = base[base["platform"].isin(platform_choice)]
 if genre_choice:
     base = base[base["genre"].isin(genre_choice)]
-
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
@@ -699,7 +671,6 @@ def keep_by_status(row: pd.Series) -> bool:
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
 
-# Apply search
 if search_name.strip():
     s = search_name.strip().lower()
     hits = base[
@@ -709,9 +680,7 @@ if search_name.strip():
 else:
     hits = base.copy()
 
-# ----------------------------
-# Two-panel layout
-# ----------------------------
+# Layout
 left, right = st.columns([1.15, 1.0], gap="large")
 
 with left:
