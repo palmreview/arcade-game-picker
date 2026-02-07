@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -18,7 +19,7 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand (optionally auto-load). "
+    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
     "Status (Want to Play / Played) is stored globally in a server-side SQLite DB."
 )
 
@@ -26,7 +27,14 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.8 • Strict Cabinet Mode • ADB robust parsing • HTTP-only ADB • Global status via SQLite • No caching"
+APP_VERSION = "1.7.1 • v1.7 baseline + Marquees (Cloudflare R2) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+
+# --- Marquees (Cloudflare R2 public URL)
+# Objects expected at:
+#   {R2_PUBLIC_ROOT}/marquees/<rom>.png
+#   {R2_PUBLIC_ROOT}/marquees/default.png
+R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
+MARQUEE_PATH_PREFIX = "marquees"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -44,8 +52,8 @@ STATUS_LABELS = {
 # DB (global state across devices)
 # ----------------------------
 def get_db() -> sqlite3.Connection:
+    # check_same_thread False is fine for Streamlit single-process usage
     return sqlite3.connect(DB_PATH, check_same_thread=False)
-
 
 def init_db() -> None:
     conn = get_db()
@@ -61,8 +69,10 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
-
 def get_all_statuses() -> dict[str, str]:
+    """
+    Returns mapping: rom -> status
+    """
     conn = get_db()
     cur = conn.execute("SELECT rom, status FROM game_status")
     rows = cur.fetchall()
@@ -73,6 +83,15 @@ def get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
+def get_status(rom: str) -> str | None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return None
+    conn = get_db()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
@@ -95,7 +114,6 @@ def set_status(rom: str, status: str | None) -> None:
     conn.commit()
     conn.close()
 
-
 # ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
@@ -103,7 +121,6 @@ def normalize_str(x) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
-
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["rom", "game", "year", "company", "genre", "platform"]:
@@ -127,11 +144,9 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
-
 
 def build_links(game_name: str):
     q = game_name.replace(" ", "+")
@@ -143,13 +158,11 @@ def build_links(game_name: str):
         "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
     }
 
-
 def game_key(row: pd.Series) -> str:
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
     return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
-
 
 def init_state():
     if "picked_rows" not in st.session_state:
@@ -162,13 +175,64 @@ def init_state():
         st.session_state.status_cache = {}
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
+    if "marquee_exists_cache" not in st.session_state:
+        st.session_state.marquee_exists_cache = {}  # rom -> bool
 
-    # ADB auto-load preferences
-    if "adb_autoload_global" not in st.session_state:
-        st.session_state.adb_autoload_global = False
-    if "adb_autoload_by_rom" not in st.session_state:
-        st.session_state.adb_autoload_by_rom = {}
+# ----------------------------
+# Image helper (Streamlit compatibility)
+# ----------------------------
+def st_image_url(url: str, caption: str | None = None):
+    """Render an image URL across Streamlit versions."""
+    try:
+        st.image(url, caption=caption, use_container_width=True)
+    except TypeError:
+        # Older Streamlit uses use_column_width
+        st.image(url, caption=caption, use_column_width=True)
 
+
+# ----------------------------
+# Marquees (Cloudflare R2)
+# ----------------------------
+def marquee_url(rom: str) -> str:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/default.png"
+    return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/{rom}.png"
+
+
+def default_marquee_url() -> str:
+    return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/default.png"
+
+
+def url_exists(url: str, timeout_sec: int = 4) -> bool:
+    """Lightweight existence check: ranged GET so we don't download the whole image."""
+    try:
+        req = Request(
+            url,
+            method="GET",
+            headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0 (ArcadeGamePicker)"},
+        )
+        with urlopen(req, timeout=timeout_sec) as resp:
+            code = getattr(resp, "status", 200)
+            return 200 <= int(code) < 400
+    except (HTTPError, URLError):
+        return False
+    except Exception:
+        return False
+
+
+def show_marquee(rom: str):
+    """Show marquee for ROM if present; otherwise fall back to default.png."""
+    rom = (rom or "").strip().lower()
+    if not rom:
+        st_image_url(default_marquee_url())
+        return
+
+    cache = st.session_state.marquee_exists_cache
+    if rom not in cache:
+        cache[rom] = url_exists(marquee_url(rom), timeout_sec=4)
+
+    st_image_url(marquee_url(rom) if cache.get(rom) else default_marquee_url())
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -207,7 +271,6 @@ BLOCKED_TITLE_HINTS = [
     "paddle",
 ]
 
-
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -232,23 +295,29 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 
     return True
 
-
 # ----------------------------
-# ADB (ArcadeItalia) integration (HTTP-only) + robust parsing
+# ADB (ArcadeItalia) on-demand integration
 # ----------------------------
 def adb_urls(rom: str):
     rom = (rom or "").strip().lower()
+    page_https = f"https://adb.arcadeitalia.net/?mame={rom}"
     page_http = f"http://adb.arcadeitalia.net/?mame={rom}"
-    params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
-    scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
-    return {"page_http": page_http, "scraper_http": scraper_http}
 
+    params = {"ajax": "query_mame", "lang": "en", "game_name": rom}
+    scraper_https = "https://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
+    scraper_http = "http://adb.arcadeitalia.net/service_scraper.php?" + urlencode(params)
+    return {
+        "page_https": page_https,
+        "page_http": page_http,
+        "scraper_https": scraper_https,
+        "scraper_http": scraper_http,
+    }
 
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.8; +https://streamlit.app)",
+            "User-Agent": "Mozilla/5.0 (ArcadeGamePicker/1.7; +https://streamlit.app)",
             "Accept": "application/json,text/plain,*/*",
         },
     )
@@ -260,7 +329,6 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
         return data
     return {"_data": data}
 
-
 def fetch_adb_details(rom: str) -> dict:
     rom = (rom or "").strip().lower()
     if not rom:
@@ -271,12 +339,13 @@ def fetch_adb_details(rom: str) -> dict:
 
     urls = adb_urls(rom)
     last_err = None
-    try:
-        data = fetch_json_url(urls["scraper_http"], timeout_sec=12)
-        st.session_state.adb_cache[rom] = data
-        return data
-    except Exception as e:
-        last_err = str(e)
+    for u in (urls["scraper_https"], urls["scraper_http"]):
+        try:
+            data = fetch_json_url(u, timeout_sec=12)
+            st.session_state.adb_cache[rom] = data
+            return data
+        except Exception as e:
+            last_err = str(e)
 
     out = {
         "_error": "Could not retrieve data from ADB right now.",
@@ -286,7 +355,6 @@ def fetch_adb_details(rom: str) -> dict:
     }
     st.session_state.adb_cache[rom] = out
     return out
-
 
 def extract_image_urls(obj) -> list[str]:
     urls = []
@@ -301,8 +369,6 @@ def extract_image_urls(obj) -> list[str]:
         elif isinstance(x, str):
             s = x.strip()
             if s.startswith("http://") or s.startswith("https://"):
-                if s.startswith("https://adb.arcadeitalia.net/"):
-                    s = "http://adb.arcadeitalia.net/" + s.split("https://adb.arcadeitalia.net/", 1)[1]
                 if re.search(r"\.(png|jpg|jpeg|webp)(\?.*)?$", s, re.IGNORECASE):
                     urls.append(s)
 
@@ -316,91 +382,6 @@ def extract_image_urls(obj) -> list[str]:
             out.append(u)
     return out
 
-
-def adb_autoload_effective(rom: str) -> bool:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return False
-    if rom in st.session_state.adb_autoload_by_rom:
-        return bool(st.session_state.adb_autoload_by_rom[rom])
-    return bool(st.session_state.adb_autoload_global)
-
-
-def _walk_kv(obj):
-    def rec(x, path):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                yield (path, k, v)
-                yield from rec(v, path + [str(k)])
-        elif isinstance(x, list):
-            for i, v in enumerate(x):
-                yield from rec(v, path + [f"[{i}]"])
-    yield from rec(obj, [])
-
-
-def _find_first_value(obj, key_candidates):
-    cands = {c.lower() for c in key_candidates}
-    for path, k, v in _walk_kv(obj):
-        if str(k).strip().lower() in cands and v not in (None, "", [], {}):
-            path_str = ".".join(path + [str(k)])
-            return v, path_str, k
-    return None, None, None
-
-
-def _coerce_text(v):
-    if v is None:
-        return ""
-    if isinstance(v, (dict, list)):
-        return json.dumps(v, ensure_ascii=False)
-    return str(v).strip()
-
-
-def parse_adb_summary(data: dict) -> tuple[dict, dict]:
-    candidates = [data]
-    for wrap_key in ("result", "data", "game", "mame", "response"):
-        if isinstance(data.get(wrap_key), dict):
-            candidates.append(data[wrap_key])
-        elif isinstance(data.get(wrap_key), list) and data[wrap_key]:
-            if isinstance(data[wrap_key][0], dict):
-                candidates.append(data[wrap_key][0])
-
-    field_map = {
-        "title": ["title", "name", "game", "game_name", "nome", "titolo"],
-        "description": ["description", "desc", "note", "descrizione", "storia", "history"],
-        "manufacturer": ["manufacturer", "company", "maker", "produttore", "manufacturer_name"],
-        "year": ["year", "release_year", "anno", "data", "date"],
-        "genre": ["genre", "category", "genere", "tipo"],
-        "players": ["players", "player", "giocatori", "num_players"],
-        "buttons": ["buttons", "button", "pulsanti", "num_buttons"],
-        "controls": ["controls", "control", "input", "controlli", "controllo", "joystick"],
-        "rotation": ["rotation", "screen", "orientation", "orientamento", "monitor", "display"],
-        "status": ["status", "working", "emulation", "emulation_status", "stato"],
-    }
-
-    summary = {}
-    paths = {}
-
-    for norm_key, key_cands in field_map.items():
-        val = None
-        path_used = None
-        key_used = None
-        for obj in candidates:
-            val, path_used, key_used = _find_first_value(obj, key_cands)
-            if val is not None:
-                break
-        if val is not None:
-            summary[norm_key] = _coerce_text(val)
-            paths[norm_key] = {"path": path_used, "key": str(key_used)}
-
-    if "year" in summary:
-        m = re.search(r"(19\d{2}|20\d{2})", summary["year"])
-        if m:
-            summary["year"] = m.group(1)
-
-    return summary, {"extracted_paths": paths, "wrap_candidates": [type(x).__name__ for x in candidates]}
-
-
-
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
     if not rom:
@@ -408,122 +389,56 @@ def show_adb_block(rom: str):
         return None
 
     urls = adb_urls(rom)
+    st.markdown("**ADB links:**")
+    st.write(f"- ADB page (HTTPS): {urls['page_https']}")
+    st.write(f"- ADB page (HTTP fallback): {urls['page_http']}")
 
-    with st.expander("ADB details + artwork", expanded=False):
-        current_auto = adb_autoload_effective(rom)
-        auto_val = st.toggle(
-            "Auto-load ADB for this game",
-            value=current_auto,
-            key=f"adb_autoload_{rom}",
-            help="If enabled, ADB details will fetch automatically when you open this game (unless already cached).",
-        )
-        st.session_state.adb_autoload_by_rom[rom] = bool(auto_val)
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
+    with c2:
+        refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
+    with c3:
+        show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
 
-        st.markdown("**ADB links (HTTP-only):**")
-        st.write(f"- ADB page: {urls['page_http']}")
-        st.write(f"- Scraper (HTTP): {urls['scraper_http']}")
+    if refresh_btn and rom in st.session_state.adb_cache:
+        del st.session_state.adb_cache[rom]
 
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            load_btn = st.button("📥 Load ADB details", key=f"adb_load_{rom}")
-        with c2:
-            refresh_btn = st.button("♻️ Refresh", key=f"adb_refresh_{rom}")
-        with c3:
-            show_images = st.toggle("Show artwork/images (if provided)", value=True, key=f"adb_img_{rom}")
-
-        if refresh_btn and rom in st.session_state.adb_cache:
-            del st.session_state.adb_cache[rom]
-
-        should_autoload_now = bool(auto_val) and (
-            rom not in st.session_state.adb_cache
-            or bool(st.session_state.adb_cache.get(rom, {}).get("_error"))
-        )
-
-        if (rom not in st.session_state.adb_cache) and (not load_btn) and (not refresh_btn) and (not should_autoload_now):
-            st.info("ADB is not loaded yet. Click **📥 Load ADB details** (or enable **Auto-load** above).")
+    if not load_btn and not refresh_btn:
+        if rom in st.session_state.adb_cache and not st.session_state.adb_cache[rom].get("_error"):
+            data = st.session_state.adb_cache[rom]
+        else:
             return None
+    else:
+        with st.spinner("Fetching from ADB..."):
+            data = fetch_adb_details(rom)
 
-        if load_btn or refresh_btn or should_autoload_now:
-            with st.spinner("Fetching from ADB..."):
-                data = fetch_adb_details(rom)
-        else:
-            data = st.session_state.adb_cache.get(rom)
-
-        if not isinstance(data, dict):
-            st.warning("ADB returned an unexpected response format.")
-            st.json(data)
-            return data
-
-        if data.get("_error"):
-            st.error(data["_error"])
-            if data.get("_detail"):
-                st.caption(f"Details: {data['_detail']}")
-            if data.get("_fallback_page"):
-                st.write(f"Try opening the ADB page directly: {data['_fallback_page']}")
-            return data
-
-        summary, dbg = parse_adb_summary(data)
-
-        if summary:
-            st.subheader("ADB Details")
-            order = ["title", "manufacturer", "year", "genre", "players", "buttons", "controls", "rotation", "status", "description"]
-            for k in order:
-                if k in summary and summary[k]:
-                    label = k.replace("_", " ").title()
-                    st.write(f"**{label}:** {summary[k]}")
-        else:
-            st.warning("ADB returned data but no recognizable fields were found.")
-
-        # ---- No nested expanders! Use tabs instead. ----
-        tab_art, tab_debug, tab_raw = st.tabs(["🖼️ Artwork", "🧩 Parse debug", "🧾 Raw JSON"])
-
-        with tab_art:
-            if not show_images:
-                st.caption("Artwork display is turned off.")
-            else:
-                imgs = extract_image_urls(data)
-
-                # If ADB returns image links without obvious extensions, keep a few additional candidates
-                # (ADB commonly serves media under /media/ and sometimes uses query strings).
-                if not imgs:
-                    extra = []
-                    for _, k, v in _walk_kv(data):
-                        if isinstance(v, str):
-                            s = v.strip()
-                            if "adb.arcadeitalia.net" in s and ("/media/" in s or "media" in s.lower()):
-                                if s.startswith("https://adb.arcadeitalia.net/"):
-                                    s = "http://adb.arcadeitalia.net/" + s.split("https://adb.arcadeitalia.net/", 1)[1]
-                                if s.startswith("//adb.arcadeitalia.net/"):
-                                    s = "http:" + s
-                                if s.startswith("http://adb.arcadeitalia.net/") or s.startswith("https://adb.arcadeitalia.net/"):
-                                    extra.append(s)
-                    # de-dupe while preserving order
-                    seen = set()
-                    imgs = []
-                    for u in extra:
-                        if u not in seen:
-                            seen.add(u)
-                            imgs.append(u)
-
-                if imgs:
-                    st.caption(f"Found {len(imgs)} image URL(s). Showing up to 12.")
-                    for u in imgs[:12]:
-                        try:
-                            st.image(u, use_container_width=True)
-                        except Exception as e:
-                            st.warning(f"Could not render image: {u}")
-                            st.caption(str(e))
-                else:
-                    st.caption("No image URLs found in the ADB response for this title.")
-
-        with tab_debug:
-            st.json(dbg)
-
-        with tab_raw:
-            st.json(data)
-
+    if isinstance(data, dict) and data.get("_error"):
+        st.error(data["_error"])
+        if data.get("_detail"):
+            st.caption(f"Details: {data['_detail']}")
         return data
 
+    st.subheader("ADB Details (summary)")
+    for k in ("title", "description", "manufacturer", "year", "genre", "players", "buttons", "controls", "rotation", "status"):
+        if k in data and data[k]:
+            val = data[k]
+            if isinstance(val, (dict, list)):
+                st.write(f"**{k}:**")
+                st.json(val)
+            else:
+                st.write(f"**{k}:** {val}")
+
+    if show_images:
+        imgs = extract_image_urls(data)
+        if imgs:
+            st.subheader("Artwork / Images")
+            for u in imgs[:10]:
+                st_image_url(u)
+        else:
+            st.caption("No direct image URLs found in the ADB response for this title.")
+
+    return data
 
 # ----------------------------
 # Status UI + caching
@@ -533,24 +448,22 @@ def load_status_cache_once():
         st.session_state.status_cache = get_all_statuses()
         st.session_state.status_cache_loaded = True
 
-
 def status_for_rom(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
     if not rom:
         return None
     return st.session_state.status_cache.get(rom)
 
-
 def update_status(rom: str, new_status: str | None):
     rom = (rom or "").strip().lower()
     if not rom:
         return
     set_status(rom, new_status)
+    # Update in-memory cache immediately
     if new_status is None:
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
-
 
 # ----------------------------
 # Details panel
@@ -563,6 +476,10 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
+    # Marquee
+    show_marquee(rom)
+
+    # Status controls
     cur_status = status_for_rom(rom)
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
@@ -592,31 +509,13 @@ def show_game_details(row: pd.Series):
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    st.markdown("### 📚 Arcade Database (ADB) (HTTP-only, on-demand / optional auto-load)")
-    show_adb_block(rom)
+    st.markdown("### 🔗 Research links")
+    for name, url in build_links(g).items():
+        st.write(f"- {name}: {url}")
 
-    # ----------------------------
-    # Research links (rolled-up with dropdown)
-    # ----------------------------
     st.markdown("---")
-    st.markdown("### 🔎 Research")
-
-    links = build_links(g)
-    # A small "rolled-up" UI: pick one link at a time
-    link_names = ["— Select a research link —"] + list(links.keys())
-    choice = st.selectbox("Research links", link_names, key=f"research_dd_{rom or g}")
-
-    if choice and choice != "— Select a research link —":
-        url = links.get(choice, "")
-        if url:
-            # Streamlit link_button is nicer when available; fall back to markdown if not.
-            if hasattr(st, "link_button"):
-                st.link_button(f"Open: {choice}", url, use_container_width=True)
-            else:
-                st.markdown(f"[Open: {choice}]({url})")
-        else:
-            st.info("No URL found for this selection.")
-
+    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
+    show_adb_block(rom)
 
 # ----------------------------
 # Boot app
@@ -624,6 +523,7 @@ def show_game_details(row: pd.Series):
 init_state()
 init_db()
 
+# Load dataset (no caching)
 try:
     df = load_games_no_cache()
 except FileNotFoundError:
@@ -634,6 +534,7 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
+# Load status cache once per session (global data)
 load_status_cache_once()
 
 # ----------------------------
@@ -645,24 +546,18 @@ st.sidebar.caption(APP_VERSION)
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
 
 st.sidebar.markdown("---")
-st.sidebar.header("📚 ADB (ArcadeItalia)")
-st.sidebar.toggle(
-    "Auto-load ADB details when opening a game (global default)",
-    value=st.session_state.adb_autoload_global,
-    key="adb_autoload_global",
-    help="Sets the default. You can override per-game inside the ADB expander.",
-)
-
-st.sidebar.markdown("---")
 st.sidebar.header("✅ Status filters")
+
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
+
 years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
 platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
 genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
+
 platform_choice = st.sidebar.multiselect("Platform (optional)", platforms)
 genre_choice = st.sidebar.multiselect("Genre (optional)", genres)
 
@@ -678,14 +573,16 @@ except Exception:
 # Build filtered view
 # ----------------------------
 base = df[(df["year"] >= years[0]) & (df["year"] <= years[1])].copy()
+
 if platform_choice:
     base = base[base["platform"].isin(platform_choice)]
 if genre_choice:
     base = base[base["genre"].isin(genre_choice)]
+
 if strict_mode:
-    base = base[base.apply(is_cabinet_compatible_strict, axis=1)].copy()
+    base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
-
+# Apply status filters
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
@@ -694,7 +591,6 @@ def keep_by_status(row: pd.Series) -> bool:
     if hide_played and s == STATUS_PLAYED:
         return False
     return True
-
 
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
@@ -771,8 +667,10 @@ with left:
     st.markdown("---")
     st.markdown("## 📜 Browse list")
 
+    # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
     view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
+
     st.dataframe(view, use_container_width=True, height=420)
 
     st.markdown("### Select a game")
@@ -815,6 +713,7 @@ with right:
         st.info("Pick a game from the list or hit Random/10 Picks to see details.")
     else:
         key = st.session_state.selected_key
+
         if key.startswith("rom:"):
             rom = key.split("rom:", 1)[1]
             match = df[df["rom"] == rom]
@@ -823,6 +722,7 @@ with right:
             else:
                 show_game_details(match.iloc[0])
         else:
+            # meta fallback (rare)
             try:
                 _, meta = key.split("meta:", 1)
                 title, year_str, company = meta.split("|", 2)
