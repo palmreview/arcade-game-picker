@@ -27,17 +27,16 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.1 • v1.7 baseline + Marquees (Cloudflare R2) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
-
-# --- Marquees (Cloudflare R2 public URL)
-# Objects expected at:
-#   {R2_PUBLIC_ROOT}/marquees/<rom>.png
-#   {R2_PUBLIC_ROOT}/marquees/default.png
-R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
-MARQUEE_PATH_PREFIX = "marquees"
+APP_VERSION = "1.7 (baseline candidate) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
+
+# --- Cloudflare R2 Public URL (r2.dev)
+# Files expected at bucket root:
+#   {R2_PUBLIC_ROOT}/<rom>.png
+#   {R2_PUBLIC_ROOT}/default.png
+R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
@@ -160,6 +159,9 @@ def build_links(game_name: str):
 
 def game_key(row: pd.Series) -> str:
     rom = normalize_str(row.get("rom", "")).lower()
+
+    # Marquee (Cloudflare R2)
+    show_marquee(rom)
     if rom:
         return f"rom:{rom}"
     return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
@@ -177,62 +179,6 @@ def init_state():
         st.session_state.status_cache_loaded = False
     if "marquee_exists_cache" not in st.session_state:
         st.session_state.marquee_exists_cache = {}  # rom -> bool
-
-# ----------------------------
-# Image helper (Streamlit compatibility)
-# ----------------------------
-def st_image_url(url: str, caption: str | None = None):
-    """Render an image URL across Streamlit versions."""
-    try:
-        st.image(url, caption=caption, use_container_width=True)
-    except TypeError:
-        # Older Streamlit uses use_column_width
-        st.image(url, caption=caption, use_column_width=True)
-
-
-# ----------------------------
-# Marquees (Cloudflare R2)
-# ----------------------------
-def marquee_url(rom: str) -> str:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/default.png"
-    return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/{rom}.png"
-
-
-def default_marquee_url() -> str:
-    return f"{R2_PUBLIC_ROOT}/{MARQUEE_PATH_PREFIX}/default.png"
-
-
-def url_exists(url: str, timeout_sec: int = 4) -> bool:
-    """Lightweight existence check: ranged GET so we don't download the whole image."""
-    try:
-        req = Request(
-            url,
-            method="GET",
-            headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0 (ArcadeGamePicker)"},
-        )
-        with urlopen(req, timeout=timeout_sec) as resp:
-            code = getattr(resp, "status", 200)
-            return 200 <= int(code) < 400
-    except (HTTPError, URLError):
-        return False
-    except Exception:
-        return False
-
-
-def show_marquee(rom: str):
-    """Show marquee for ROM if present; otherwise fall back to default.png."""
-    rom = (rom or "").strip().lower()
-    if not rom:
-        st_image_url(default_marquee_url())
-        return
-
-    cache = st.session_state.marquee_exists_cache
-    if rom not in cache:
-        cache[rom] = url_exists(marquee_url(rom), timeout_sec=4)
-
-    st_image_url(marquee_url(rom) if cache.get(rom) else default_marquee_url())
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -434,7 +380,7 @@ def show_adb_block(rom: str):
         if imgs:
             st.subheader("Artwork / Images")
             for u in imgs[:10]:
-                st_image_url(u)
+                _st_image(u)
         else:
             st.caption("No direct image URLs found in the ADB response for this title.")
 
@@ -468,6 +414,68 @@ def update_status(rom: str, new_status: str | None):
 # ----------------------------
 # Details panel
 # ----------------------------
+
+# ----------------------------
+# Image helper (Streamlit compatibility)
+# ----------------------------
+def _st_image(url: str, *, caption: str | None = None):
+    """Render an image URL in a way that works across Streamlit versions."""
+    try:
+        st.image(url, caption=caption, use_container_width=True)
+    except TypeError:
+        # Older Streamlit versions use use_column_width
+        st.image(url, caption=caption, use_column_width=True)
+
+
+# ----------------------------
+# Marquees (Cloudflare R2)
+# ----------------------------
+def marquee_url(rom: str) -> str:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return f"{R2_PUBLIC_ROOT}/default.png"
+    return f"{R2_PUBLIC_ROOT}/{rom}.png"
+
+
+def default_marquee_url() -> str:
+    return f"{R2_PUBLIC_ROOT}/default.png"
+
+
+def url_exists(url: str, timeout_sec: int = 4) -> bool:
+    """Lightweight existence check using a tiny ranged GET."""
+    try:
+        req = Request(
+            url,
+            method="GET",
+            headers={"User-Agent": "Mozilla/5.0 (ArcadeGamePicker)", "Range": "bytes=0-0"},
+        )
+        with urlopen(req, timeout=timeout_sec) as resp:
+            code = getattr(resp, "status", 200)
+            return 200 <= int(code) < 400
+    except HTTPError:
+        return False
+    except URLError:
+        return False
+    except Exception:
+        return False
+
+
+def show_marquee(rom: str):
+    """Show ROM marquee if present; otherwise show default.png."""
+    rom = (rom or "").strip().lower()
+    if not rom:
+        _st_image(default_marquee_url())
+        return
+
+    cache: dict = st.session_state.marquee_exists_cache
+    if rom not in cache:
+        cache[rom] = url_exists(marquee_url(rom), timeout_sec=4)
+
+    if cache.get(rom):
+        _st_image(marquee_url(rom))
+    else:
+        _st_image(default_marquee_url())
+
 def show_game_details(row: pd.Series):
     g = normalize_str(row.get("game", ""))
     y = int(row.get("year", 0))
@@ -475,9 +483,6 @@ def show_game_details(row: pd.Series):
     genre = normalize_str(row.get("genre", ""))
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
-
-    # Marquee
-    show_marquee(rom)
 
     # Status controls
     cur_status = status_for_rom(rom)
