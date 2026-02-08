@@ -27,7 +27,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7 (baseline candidate) • Strict Cabinet Mode • ADB on-demand • Global status via SQLite • No caching"
+APP_VERSION = "1.7.x • Baseline v1.7 + Marquees (R2) + Status: Want/Played/Don’t have ROM/Not playable • ADB on-demand • Global status via SQLite • No CSV caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -40,13 +40,16 @@ R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
+STATUS_NO_ROM = "dont_have_rom"
+STATUS_NOT_PLAYABLE = "not_playable"
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
+    STATUS_NO_ROM: "🧩 Don’t have ROM",
+    STATUS_NOT_PLAYABLE: "🚫 Not playable",
 }
-
 # ----------------------------
 # DB (global state across devices)
 # ----------------------------
@@ -380,7 +383,7 @@ def show_adb_block(rom: str):
         if imgs:
             st.subheader("Artwork / Images")
             for u in imgs[:10]:
-                st.image(u, use_container_width=True)
+                _st_image(u)
         else:
             st.caption("No direct image URLs found in the ADB response for this title.")
 
@@ -410,6 +413,29 @@ def update_status(rom: str, new_status: str | None):
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
+
+
+# ----------------------------
+# Export: Want to Play (.txt)
+# ----------------------------
+def build_want_to_play_txt(df: pd.DataFrame) -> str:
+    want_roms = {rom for rom, status in st.session_state.status_cache.items() if status == STATUS_WANT}
+    if not want_roms:
+        return "No games marked as Want to Play."
+
+    subset = df[df["rom"].isin(want_roms)].copy()
+    subset = subset.sort_values(["year", "game"])
+
+    lines: list[str] = []
+    for _, row in subset.iterrows():
+        game = row.get("game", "")
+        year = row.get("year", "")
+        company = row.get("company", "")
+        genre = row.get("genre", "")
+        rom = row.get("rom", "")
+        lines.append(f"{game} ({year}) — {company} — {genre} — ROM: {rom}")
+
+    return "\n".join(lines)
 
 # ----------------------------
 # Details panel
@@ -501,7 +527,12 @@ def show_game_details(row: pd.Series):
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
-    s1, s2, s3 = st.columns([1, 1, 1])
+    if cur_status == STATUS_NOT_PLAYABLE:
+        st.warning("This game is marked 🚫 Not playable and is hidden from discovery by default.")
+    elif cur_status == STATUS_NO_ROM:
+        st.info("This game is marked 🧩 Don’t have ROM and is hidden from discovery by default.")
+
+    s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
@@ -511,10 +542,17 @@ def show_game_details(row: pd.Series):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
     with s3:
+        if st.button("🧩 Don’t have ROM", use_container_width=True, key=f"st_norom_{rom}"):
+            update_status(rom, STATUS_NO_ROM)
+            st.rerun()
+    with s4:
+        if st.button("🚫 Not playable", use_container_width=True, key=f"st_noplay_{rom}"):
+            update_status(rom, STATUS_NOT_PLAYABLE)
+            st.rerun()
+    with s5:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
-
     st.write(f"**Year:** {y}")
     if c:
         st.write(f"**Company:** {c}")
@@ -525,14 +563,12 @@ def show_game_details(row: pd.Series):
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    st.markdown("### 🔗 Research links")
-    for name, url in build_links(g).items():
-        st.write(f"- {name}: {url}")
+    with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
+        show_adb_block(rom)
 
-    st.markdown("---")
-    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
-    show_adb_block(rom)
-
+    with st.expander("🔗 Other research links", expanded=False):
+        for name, url in build_links(g).items():
+            st.write(f"- {name}: {url}")
 # ----------------------------
 # Boot app
 # ----------------------------
@@ -567,6 +603,20 @@ st.sidebar.header("✅ Status filters")
 
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
+
+# Hide these by default (they clutter discovery)
+show_no_rom = st.sidebar.toggle("Show 🧩 Don’t have ROM", value=False)
+show_not_playable = st.sidebar.toggle("Show 🚫 Not playable", value=False)
+
+st.sidebar.markdown("---")
+want_count = sum(1 for s in st.session_state.status_cache.values() if s == STATUS_WANT)
+st.sidebar.download_button(
+    label=f"📤 Export Want to Play ({want_count})",
+    data=build_want_to_play_txt(df),
+    file_name="arcade_want_to_play.txt",
+    mime="text/plain",
+    use_container_width=True,
+)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
@@ -603,6 +653,13 @@ if strict_mode:
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
+
+    # Hide these by default unless explicitly included
+    if (not show_no_rom) and s == STATUS_NO_ROM:
+        return False
+    if (not show_not_playable) and s == STATUS_NOT_PLAYABLE:
+        return False
+
     if only_want:
         return s == STATUS_WANT
     if hide_played and s == STATUS_PLAYED:
