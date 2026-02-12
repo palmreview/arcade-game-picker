@@ -1,4 +1,3 @@
-
 import json
 import re
 import sqlite3
@@ -660,6 +659,7 @@ strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", valu
 st.sidebar.subheader("Status filters")
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
+only_played = st.sidebar.toggle("Show only ✅ Played", value=False)  # NEW
 
 show_no_rom = st.sidebar.toggle("Include 🧩 Don't have ROM", value=False)
 show_not_playable = st.sidebar.toggle("Include 🚫 Not playable", value=False)
@@ -703,6 +703,10 @@ if strict_mode:
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
+
+    # NEW: played-only filter (takes precedence if enabled)
+    if only_played:
+        return s == STATUS_PLAYED
 
     if only_want:
         return s == STATUS_WANT
