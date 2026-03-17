@@ -26,7 +26,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.2 • Notes restored • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • Global status via SQLite • No caching"
+APP_VERSION = "1.7.1 • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -44,7 +44,12 @@ STATUS_LABELS = {
 # ----------------------------
 # DB (global state across devices)
 # ----------------------------
-def ensure_db_schema(conn: sqlite3.Connection) -> None:
+def get_db() -> sqlite3.Connection:
+    # check_same_thread False is fine for Streamlit single-process usage
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db() -> None:
+    conn = get_db()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS game_status (
@@ -54,27 +59,7 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS game_notes (
-            rom TEXT PRIMARY KEY,
-            note TEXT,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
     conn.commit()
-
-
-def get_db() -> sqlite3.Connection:
-    # check_same_thread False is fine for Streamlit single-process usage
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    ensure_db_schema(conn)
-    return conn
-
-
-def init_db() -> None:
-    conn = get_db()
     conn.close()
 
 def get_all_statuses() -> dict[str, str]:
@@ -82,15 +67,9 @@ def get_all_statuses() -> dict[str, str]:
     Returns mapping: rom -> status
     """
     conn = get_db()
-    try:
-        cur = conn.execute("SELECT rom, status FROM game_status")
-        rows = cur.fetchall()
-    except sqlite3.OperationalError:
-        ensure_db_schema(conn)
-        cur = conn.execute("SELECT rom, status FROM game_status")
-        rows = cur.fetchall()
-    finally:
-        conn.close()
+    cur = conn.execute("SELECT rom, status FROM game_status")
+    rows = cur.fetchall()
+    conn.close()
     out = {}
     for rom, status in rows:
         if rom:
@@ -102,109 +81,31 @@ def get_status(rom: str) -> str | None:
     if not rom:
         return None
     conn = get_db()
-    try:
-        cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-        row = cur.fetchone()
-        return row[0] if row else None
-    except sqlite3.OperationalError:
-        ensure_db_schema(conn)
-        cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-        row = cur.fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
     conn = get_db()
-    try:
-        if status is None:
-            conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-        else:
-            conn.execute(
-                """
-                INSERT INTO game_status (rom, status, updated_at)
-                VALUES (?, ?, datetime('now'))
-                ON CONFLICT(rom) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=datetime('now')
-                """,
-                (rom, status),
-            )
-        conn.commit()
-    except sqlite3.OperationalError:
-        ensure_db_schema(conn)
-        if status is None:
-            conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-        else:
-            conn.execute(
-                """
-                INSERT INTO game_status (rom, status, updated_at)
-                VALUES (?, ?, datetime('now'))
-                ON CONFLICT(rom) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=datetime('now')
-                """,
-                (rom, status),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-# ----------------------------
-# Notes (local SQLite, per ROM)
-# ----------------------------
-def get_note(rom: str) -> str:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return ""
-    conn = get_db()
-    try:
-        cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
-        row = cur.fetchone()
-        return row[0] if row and row[0] is not None else ""
-    except sqlite3.OperationalError:
-        ensure_db_schema(conn)
-        cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
-        row = cur.fetchone()
-        return row[0] if row and row[0] is not None else ""
-    finally:
-        conn.close()
-
-def set_note(rom: str, note: str) -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    conn = get_db()
-    try:
+    if status is None:
+        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
+    else:
         conn.execute(
             """
-            INSERT INTO game_notes (rom, note, updated_at)
+            INSERT INTO game_status (rom, status, updated_at)
             VALUES (?, ?, datetime('now'))
             ON CONFLICT(rom) DO UPDATE SET
-                note=excluded.note,
+                status=excluded.status,
                 updated_at=datetime('now')
             """,
-            (rom, note),
+            (rom, status),
         )
-        conn.commit()
-    except sqlite3.OperationalError:
-        ensure_db_schema(conn)
-        conn.execute(
-            """
-            INSERT INTO game_notes (rom, note, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(rom) DO UPDATE SET
-                note=excluded.note,
-                updated_at=datetime('now')
-            """,
-            (rom, note),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn.commit()
+    conn.close()
 
 # ----------------------------
 # Helpers: normalization / dataset
@@ -591,54 +492,6 @@ def show_game_details(row: pd.Series):
         st.write(f"**Platform:** {platform}")
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
-
-    with st.expander("📝 Notes", expanded=False):
-        current_note = get_note(rom) if rom else ""
-        note_key = f"note_text_{rom or game_key(row)}"
-        if note_key not in st.session_state:
-            st.session_state[note_key] = current_note
-
-        uploaded = st.file_uploader(
-            "Import notes (.txt, .md, .json)",
-            type=["txt", "md", "json"],
-            key=f"note_upload_{rom or game_key(row)}",
-            help="Upload a text-like file and paste it into the notes area.",
-        )
-        append_import = st.toggle("Append imported text", value=False, key=f"note_append_{rom or game_key(row)}")
-        if uploaded is not None:
-            try:
-                imported_text = uploaded.read().decode("utf-8", errors="replace")
-                if append_import and st.session_state[note_key].strip():
-                    sep = "\n\n" if not st.session_state[note_key].endswith("\n") else "\n"
-                    st.session_state[note_key] = st.session_state[note_key] + sep + imported_text
-                else:
-                    st.session_state[note_key] = imported_text
-                st.success("Imported into notes editor. Save notes to keep it.")
-            except Exception as e:
-                st.error(f"Could not import notes: {e}")
-
-        st.session_state[note_key] = st.text_area(
-            "Your notes",
-            value=st.session_state[note_key],
-            height=220,
-            key=f"note_editor_{rom or game_key(row)}",
-            placeholder="Paste your research notes here...",
-        )
-
-        n1, n2 = st.columns(2)
-        with n1:
-            if st.button("💾 Save notes", use_container_width=True, key=f"note_save_{rom or game_key(row)}"):
-                if rom:
-                    set_note(rom, st.session_state[note_key])
-                    st.success("Notes saved.")
-                else:
-                    st.warning("Notes require a ROM short name for this entry.")
-        with n2:
-            if st.button("🧽 Clear notes", use_container_width=True, key=f"note_clear_{rom or game_key(row)}"):
-                st.session_state[note_key] = ""
-                if rom:
-                    set_note(rom, "")
-                st.rerun()
 
     with st.expander("🔗 Research links", expanded=False):
         for name, url in build_links(g).items():
