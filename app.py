@@ -1,10 +1,12 @@
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -17,35 +19,102 @@ st.set_page_config(page_title="Arcade Game Picker", layout="wide")
 
 st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
-    "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
-    "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Status (Want to Play / Played) is stored globally in a server-side SQLite DB."
+    "Cabinet-first discovery: find games you can actually play at home, keep your own research notes, and see artwork. "
+    "ADB details/artwork load on-demand. Statuses use Supabase when configured, with SQLite fallback. "
+    "Notes are stored locally in SQLite."
 )
 
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.1 • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • Global status via SQLite • No caching"
+APP_VERSION = "1.7-notes+ • Supabase-first status persistence (SQLite fallback) • Restored status filters • Collapsible notes pane"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
-R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
+STATUS_NO_ROM = "dont_have_rom"
+STATUS_NOT_PLAYABLE = "not_playable"
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
+    STATUS_NO_ROM: "🧩 Don't have ROM",
+    STATUS_NOT_PLAYABLE: "🚫 Not playable",
 }
 
 # ----------------------------
-# DB (global state across devices)
+# Supabase-first status persistence + SQLite notes/status fallback
 # ----------------------------
+def _get_secret(name: str) -> str | None:
+    try:
+        val = st.secrets.get(name)
+    except Exception:
+        val = None
+    if val is None:
+        val = st.session_state.get(name)
+    if val is None:
+        val = os.getenv(name)
+    if isinstance(val, str):
+        val = val.strip()
+    return val or None
+
+def supabase_enabled() -> bool:
+    url = _get_secret("SUPABASE_URL")
+    key = _get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY")
+    return bool(url) and bool(key)
+
+def _sb_base() -> str:
+    return (_get_secret("SUPABASE_URL") or "").rstrip("/")
+
+def _sb_key() -> str:
+    return (_get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY") or "").strip()
+
+def _sb_headers(extra: dict | None = None) -> dict:
+    key = _sb_key()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+def supabase_get_all_statuses(table: str = "game_status") -> dict[str, str]:
+    url = f"{_sb_base()}/rest/v1/{table}?select=rom,status"
+    req = Request(url, headers=_sb_headers(), method="GET")
+    with urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    out: dict[str, str] = {}
+    if isinstance(data, list):
+        for row in data:
+            rom = (row.get("rom") or "").strip().lower()
+            if rom:
+                out[rom] = row.get("status")
+    return out
+
+def supabase_set_status(rom: str, status: str | None, table: str = "game_status") -> None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+
+    if status is None:
+        url = f"{_sb_base()}/rest/v1/{table}?rom=eq.{quote(rom)}"
+        req = Request(url, headers=_sb_headers(), method="DELETE")
+        with urlopen(req, timeout=15):
+            return
+
+    url = f"{_sb_base()}/rest/v1/{table}"
+    body = json.dumps({"rom": rom, "status": status}).encode("utf-8")
+    req = Request(url, data=body, headers=_sb_headers({"Prefer": "resolution=merge-duplicates"}), method="POST")
+    with urlopen(req, timeout=15):
+        return
+
 def get_db() -> sqlite3.Connection:
-    # check_same_thread False is fine for Streamlit single-process usage
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db() -> None:
@@ -59,13 +128,19 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_notes (
+            notes_key TEXT PRIMARY KEY,
+            notes_text TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
-def get_all_statuses() -> dict[str, str]:
-    """
-    Returns mapping: rom -> status
-    """
+def sqlite_get_all_statuses() -> dict[str, str]:
     conn = get_db()
     cur = conn.execute("SELECT rom, status FROM game_status")
     rows = cur.fetchall()
@@ -76,17 +151,22 @@ def get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
-def get_status(rom: str) -> str | None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return None
-    conn = get_db()
-    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
+def get_all_statuses() -> dict[str, str]:
+    if supabase_enabled():
+        try:
+            return supabase_get_all_statuses()
+        except Exception:
+            return sqlite_get_all_statuses()
+    return sqlite_get_all_statuses()
 
 def set_status(rom: str, status: str | None) -> None:
+    if supabase_enabled():
+        try:
+            supabase_set_status(rom, status)
+            return
+        except Exception:
+            pass
+
     rom = (rom or "").strip().lower()
     if not rom:
         return
@@ -104,6 +184,45 @@ def set_status(rom: str, status: str | None) -> None:
             """,
             (rom, status),
         )
+    conn.commit()
+    conn.close()
+
+def get_notes(notes_key: str) -> str:
+    notes_key = (notes_key or "").strip().lower()
+    if not notes_key:
+        return ""
+    conn = get_db()
+    cur = conn.execute("SELECT notes_text FROM game_notes WHERE notes_key=?", (notes_key,))
+    row = cur.fetchone()
+    conn.close()
+    if not row or row[0] is None:
+        return ""
+    return str(row[0])
+
+def set_notes(notes_key: str, notes_text: str) -> None:
+    notes_key = (notes_key or "").strip().lower()
+    if not notes_key:
+        return
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO game_notes (notes_key, notes_text, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(notes_key) DO UPDATE SET
+            notes_text=excluded.notes_text,
+            updated_at=datetime('now')
+        """,
+        (notes_key, notes_text),
+    )
+    conn.commit()
+    conn.close()
+
+def clear_notes(notes_key: str) -> None:
+    notes_key = (notes_key or "").strip().lower()
+    if not notes_key:
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM game_notes WHERE notes_key=?", (notes_key,))
     conn.commit()
     conn.close()
 
@@ -168,8 +287,8 @@ def init_state():
         st.session_state.status_cache = {}
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
-    if "marquee_bytes_cache" not in st.session_state:
-        st.session_state.marquee_bytes_cache = {}
+    if "notes_cache" not in st.session_state:
+        st.session_state.notes_cache = {}
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -231,54 +350,6 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
             return False
 
     return True
-
-# ----------------------------
-# Streamlit image helper (compat)
-# ----------------------------
-def _st_image(data, *, caption: str | None = None):
-    try:
-        st.image(data, caption=caption, use_container_width=True)
-    except TypeError:
-        st.image(data, caption=caption, use_column_width=True)
-
-# ----------------------------
-# Marquees (R2) - ROM image, fallback to default.png
-# ----------------------------
-def marquee_url(rom: str) -> str:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return f"{R2_PUBLIC_ROOT}/default.png"
-    return f"{R2_PUBLIC_ROOT}/{rom}.png"
-
-def default_marquee_url() -> str:
-    return f"{R2_PUBLIC_ROOT}/default.png"
-
-def fetch_image_bytes(url: str, timeout_sec: int = 10) -> bytes | None:
-    cache: dict = st.session_state.marquee_bytes_cache
-    if url in cache:
-        return cache[url]
-    try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (ArcadeGamePicker)"}, method="GET")
-        with urlopen(req, timeout=timeout_sec) as resp:
-            b = resp.read()
-        cache[url] = b
-        return b
-    except Exception:
-        cache[url] = None
-        return None
-
-def show_marquee(rom: str):
-    rom = (rom or "").strip().lower()
-
-    if rom:
-        b = fetch_image_bytes(marquee_url(rom), timeout_sec=10)
-        if b:
-            _st_image(b)
-            return
-
-    b2 = fetch_image_bytes(default_marquee_url(), timeout_sec=10)
-    if b2:
-        _st_image(b2)
 
 # ----------------------------
 # ADB (ArcadeItalia) on-demand integration
@@ -419,7 +490,7 @@ def show_adb_block(rom: str):
         if imgs:
             st.subheader("Artwork / Images")
             for u in imgs[:10]:
-                _st_image(u)
+                st.image(u, use_container_width=True)
         else:
             st.caption("No direct image URLs found in the ADB response for this title.")
 
@@ -461,17 +532,15 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
-    show_marquee(rom)
-
     # Status controls
     cur_status = status_for_rom(rom)
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
-    s1, s2, s3 = st.columns([1, 1, 1])
+    s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
     with s1:
-        if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
+        if st.button("⏳ Want", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
             st.rerun()
     with s2:
@@ -479,26 +548,97 @@ def show_game_details(row: pd.Series):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
     with s3:
+        if st.button("🧩 No ROM", use_container_width=True, key=f"st_norom_{rom}"):
+            update_status(rom, STATUS_NO_ROM)
+            st.rerun()
+    with s4:
+        if st.button("🚫 Can't play", use_container_width=True, key=f"st_np_{rom}"):
+            update_status(rom, STATUS_NOT_PLAYABLE)
+            st.rerun()
+    with s5:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
 
-    st.write(f"**Year:** {y}")
-    if c:
-        st.write(f"**Company:** {c}")
-    if genre:
-        st.write(f"**Genre:** {genre}")
-    if platform:
-        st.write(f"**Platform:** {platform}")
-    if rom:
-        st.write(f"**ROM (MAME short name):** `{rom}`")
+    with st.expander("📌 Quick facts", expanded=True):
+        st.write(f"**Year:** {y}")
+        if c:
+            st.write(f"**Company:** {c}")
+        if genre:
+            st.write(f"**Genre:** {genre}")
+        if platform:
+            st.write(f"**Platform:** {platform}")
+        if rom:
+            st.write(f"**ROM (MAME short name):** `{rom}`")
 
-    with st.expander("🔗 Research links", expanded=False):
-        for name, url in build_links(g).items():
-            st.write(f"- {name}: {url}")
+    notes_key = (rom or f"{g}|{y}|{c}").strip().lower()
+    notes_safe_key = re.sub(r"[^a-z0-9_:-]+", "_", notes_key)
+    if notes_key not in st.session_state.notes_cache:
+        st.session_state.notes_cache[notes_key] = get_notes(notes_key)
 
-    with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
-        show_adb_block(rom)
+    with st.expander("📝 Notes", expanded=False):
+        st.caption("Starts blank. Paste in your own research or upload a text file into this game's notes area.")
+
+        uploaded_file = st.file_uploader(
+            "Upload notes file",
+            type=["txt", "md", "markdown", "csv", "json"],
+            key=f"notes_upload_{notes_safe_key}",
+        )
+        import_mode = st.radio(
+            "Import mode",
+            ["Replace notes", "Append to notes"],
+            horizontal=True,
+            key=f"notes_mode_{notes_safe_key}",
+        )
+
+        notes_value = st.text_area(
+            "Your notes",
+            value=st.session_state.notes_cache.get(notes_key, ""),
+            height=260,
+            key=f"notes_editor_{notes_safe_key}",
+            placeholder="Paste search results, history notes, strategy notes, cabinet notes, links, or anything else here...",
+        )
+
+        n1, n2, n3 = st.columns([1, 1, 1])
+        with n1:
+            save_notes_btn = st.button("💾 Save notes", use_container_width=True, key=f"save_notes_{notes_safe_key}")
+        with n2:
+            import_notes_btn = st.button("📥 Import file", use_container_width=True, key=f"import_notes_{notes_safe_key}")
+        with n3:
+            clear_notes_btn = st.button("🧽 Clear notes", use_container_width=True, key=f"clear_notes_{notes_safe_key}")
+
+        if save_notes_btn:
+            set_notes(notes_key, notes_value)
+            st.session_state.notes_cache[notes_key] = notes_value
+            st.success("Notes saved.")
+
+        if import_notes_btn:
+            if uploaded_file is None:
+                st.warning("Choose a notes file first.")
+            else:
+                try:
+                    uploaded_text = uploaded_file.read().decode("utf-8", errors="replace")
+                    merged_text = uploaded_text
+                    if import_mode == "Append to notes" and notes_value.strip():
+                        merged_text = notes_value.rstrip() + "\n\n" + uploaded_text.strip()
+                    set_notes(notes_key, merged_text)
+                    st.session_state.notes_cache[notes_key] = merged_text
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not import notes file: {e}")
+
+        if clear_notes_btn:
+            clear_notes(notes_key)
+            st.session_state.notes_cache[notes_key] = ""
+            st.rerun()
+
+    st.markdown("### 🔗 Research links")
+    for name, url in build_links(g).items():
+        st.write(f"- {name}: {url}")
+
+    st.markdown("---")
+    st.markdown("### 📚 Arcade Database (ADB) details + artwork (on-demand)")
+    show_adb_block(rom)
 
 # ----------------------------
 # Boot app
@@ -520,27 +660,31 @@ except Exception as e:
 # Load status cache once per session (global data)
 load_status_cache_once()
 
+if supabase_enabled():
+    st.sidebar.caption("Status storage: Supabase-first (SQLite fallback)")
+else:
+    st.sidebar.caption("Status storage: SQLite local")
+
 # ----------------------------
 # Sidebar: Cabinet mode + status filtering
 # ----------------------------
-st.sidebar.header("🎛️ Cabinet Mode")
+st.sidebar.header("🎛️ Controls")
 st.sidebar.caption(APP_VERSION)
 
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
 
-st.sidebar.markdown("---")
-st.sidebar.header("✅ Status filters")
-
+st.sidebar.subheader("Status filters")
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
+only_played = st.sidebar.toggle("Show only ✅ Played", value=False)
+show_no_rom = st.sidebar.toggle("Include 🧩 Don't have ROM", value=False)
+show_not_playable = st.sidebar.toggle("Include 🚫 Not playable", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
-
 years = st.sidebar.slider("Year range", 1978, 2008, (1978, 2008))
 platforms = sorted(df["platform"].replace("", pd.NA).dropna().unique().tolist())
 genres = sorted(df["genre"].replace("", pd.NA).dropna().unique().tolist())
-
 platform_choice = st.sidebar.multiselect("Platform (optional)", platforms)
 genre_choice = st.sidebar.multiselect("Genre (optional)", genres)
 
@@ -569,9 +713,16 @@ if strict_mode:
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
+
+    if only_played:
+        return s == STATUS_PLAYED
     if only_want:
         return s == STATUS_WANT
     if hide_played and s == STATUS_PLAYED:
+        return False
+    if (not show_no_rom) and s == STATUS_NO_ROM:
+        return False
+    if (not show_not_playable) and s == STATUS_NOT_PLAYABLE:
         return False
     return True
 
