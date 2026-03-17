@@ -4,9 +4,9 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode, quote
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -21,14 +21,14 @@ st.title("🕹️ Arcade Game Picker (1978–2008)")
 st.caption(
     "Cabinet-first discovery: find games you can actually play at home, learn the history, and see artwork. "
     "CSV caching is disabled so data updates apply immediately. ADB details/artwork load on-demand. "
-    "Statuses persist in Supabase when configured (SQLite fallback). Notes stay local in SQLite."
+    "Status and notes use Supabase first when configured, with SQLite fallback."
 )
 
 # ----------------------------
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.3 • Marquee fallback • Notes pane • Collapsible research links/ADB • Supabase-first status persistence • SQLite notes fallback • Restored status filters"
+APP_VERSION = "1.7.3 • Notes moved to Supabase-first • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • SQLite fallback • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -36,87 +36,34 @@ R2_PUBLIC_ROOT = "https://pub-04cb80aef9834a5d908ddf7538b7fffa.r2.dev"
 
 STATUS_WANT = "want_to_play"
 STATUS_PLAYED = "played"
-STATUS_NO_ROM = "dont_have_rom"
-STATUS_NOT_PLAYABLE = "not_playable"
 
 STATUS_LABELS = {
     None: "—",
     STATUS_WANT: "⏳ Want to Play",
     STATUS_PLAYED: "✅ Played",
-    STATUS_NO_ROM: "🧩 Don't have ROM",
-    STATUS_NOT_PLAYABLE: "🚫 Not playable",
 }
 
-
 # ----------------------------
-# Status persistence: Supabase-first, SQLite fallback
-# Notes: local SQLite
+# Persistence: Supabase first, SQLite fallback
 # ----------------------------
-def _get_secret(name: str) -> str | None:
+def _secret_or_env(name: str, default: str = "") -> str:
     try:
-        val = st.secrets.get(name)
+        val = st.secrets.get(name, default)
+        if val:
+            return str(val)
     except Exception:
-        val = None
-    if val is None:
-        val = st.session_state.get(name)
-    if isinstance(val, str):
-        val = val.strip()
-    return val or None
+        pass
+    return os.environ.get(name, default)
 
-def supabase_enabled() -> bool:
-    url = _get_secret("SUPABASE_URL")
-    key = _get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY")
-    return bool(url) and bool(key)
+SUPABASE_URL = _secret_or_env("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = _secret_or_env("SUPABASE_KEY", "") or _secret_or_env("SUPABASE_ANON_KEY", "")
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
-def _sb_base() -> str:
-    return (_get_secret("SUPABASE_URL") or "").rstrip("/")
+def get_db() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def _sb_key() -> str:
-    return (_get_secret("SUPABASE_ANON_KEY") or _get_secret("SUPABASE_KEY") or "").strip()
-
-def _sb_headers(extra: dict | None = None) -> dict:
-    key = _sb_key()
-    h = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    if extra:
-        h.update(extra)
-    return h
-
-def supabase_get_all_statuses(table: str = "game_status") -> dict[str, str]:
-    url = f"{_sb_base()}/rest/v1/{table}?select=rom,status"
-    req = Request(url, headers=_sb_headers(), method="GET")
-    with urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    out: dict[str, str] = {}
-    if isinstance(data, list):
-        for row in data:
-            rom = (row.get("rom") or "").strip().lower()
-            if rom:
-                out[rom] = row.get("status")
-    return out
-
-def supabase_set_status(rom: str, status: str | None, table: str = "game_status") -> None:
-    rom = (rom or "").strip().lower()
-    if not rom:
-        return
-    base = _sb_base()
-    headers = _sb_headers()
-    if status is None:
-        url = f"{base}/rest/v1/{table}?rom=eq.{quote(rom)}"
-        req = Request(url, headers=headers, method="DELETE")
-        with urlopen(req, timeout=15):
-            return
-    url = f"{base}/rest/v1/{table}"
-    body = json.dumps({"rom": rom, "status": status}).encode("utf-8")
-    headers2 = _sb_headers({"Prefer": "resolution=merge-duplicates"})
-    req = Request(url, data=body, headers=headers2, method="POST")
-    with urlopen(req, timeout=15):
-        return
-
-def ensure_db_schema(conn: sqlite3.Connection) -> None:
+def init_db() -> None:
+    conn = get_db()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS game_status (
@@ -136,104 +83,195 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    ensure_db_schema(conn)
-    return conn
-
-def init_db() -> None:
-    conn = get_db()
     conn.close()
 
-def sqlite_get_all_statuses() -> dict[str, str]:
-    conn = get_db()
+def _sb_headers(prefer: str | None = None) -> dict:
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+def _sb_request(method: str, path: str, params: dict | None = None, payload=None, prefer: str | None = None):
+    if not SUPABASE_ENABLED:
+        raise RuntimeError("Supabase is not configured")
+    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+    if params:
+        url += "?" + urlencode(params)
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=data, method=method.upper())
+    for k, v in _sb_headers(prefer).items():
+        req.add_header(k, v)
     try:
-        cur = conn.execute("SELECT rom, status FROM game_status")
-        rows = cur.fetchall()
-    finally:
-        conn.close()
+        with urlopen(req, timeout=15) as resp:
+            body = resp.read()
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8"))
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Supabase HTTP {e.code}: {body[:300]}") from e
+    except URLError as e:
+        raise RuntimeError(f"Supabase network error: {e}") from e
+
+def _sqlite_get_all_statuses() -> dict[str, str]:
+    conn = get_db()
+    cur = conn.execute("SELECT rom, status FROM game_status")
+    rows = cur.fetchall()
+    conn.close()
     out = {}
     for rom, status in rows:
         if rom:
             out[str(rom).strip().lower()] = status
     return out
 
-def sqlite_set_status(rom: str, status: str | None) -> None:
+def _supabase_get_all_statuses() -> dict[str, str]:
+    rows = _sb_request("GET", "game_status", {"select": "rom,status", "limit": "5000"}) or []
+    out = {}
+    for row in rows:
+        rom = str(row.get("rom", "")).strip().lower()
+        status = row.get("status")
+        if rom:
+            out[rom] = status
+    return out
+
+def get_all_statuses() -> dict[str, str]:
+    if SUPABASE_ENABLED:
+        try:
+            return _supabase_get_all_statuses()
+        except Exception:
+            pass
+    return _sqlite_get_all_statuses()
+
+def _sqlite_get_status(rom: str) -> str | None:
+    conn = get_db()
+    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def _supabase_get_status(rom: str) -> str | None:
+    rows = _sb_request("GET", "game_status", {"select": "status", "rom": f"eq.{rom}", "limit": "1"}) or []
+    return rows[0].get("status") if rows else None
+
+def get_status(rom: str) -> str | None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return None
+    if SUPABASE_ENABLED:
+        try:
+            return _supabase_get_status(rom)
+        except Exception:
+            pass
+    return _sqlite_get_status(rom)
+
+def _sqlite_set_status(rom: str, status: str | None) -> None:
+    conn = get_db()
+    if status is None:
+        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
+    else:
+        conn.execute(
+            """
+            INSERT INTO game_status (rom, status, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(rom) DO UPDATE SET
+                status=excluded.status,
+                updated_at=datetime('now')
+            """,
+            (rom, status),
+        )
+    conn.commit()
+    conn.close()
+
+def _supabase_set_status(rom: str, status: str | None) -> None:
+    if status is None:
+        _sb_request("DELETE", "game_status", {"rom": f"eq.{rom}"})
+    else:
+        _sb_request(
+            "POST",
+            "game_status",
+            payload={"rom": rom, "status": status},
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
+    if SUPABASE_ENABLED:
+        try:
+            _supabase_set_status(rom, status)
+            return
+        except Exception:
+            pass
+    _sqlite_set_status(rom, status)
+
+def _sqlite_get_note(rom: str) -> str:
     conn = get_db()
-    try:
-        if status is None:
-            conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-        else:
-            conn.execute(
-                """
-                INSERT INTO game_status (rom, status, updated_at)
-                VALUES (?, ?, datetime('now'))
-                ON CONFLICT(rom) DO UPDATE SET
-                    status=excluded.status,
-                    updated_at=datetime('now')
-                """,
-                (rom, status),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+    cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else ""
 
-def get_all_statuses() -> dict[str, str]:
-    if supabase_enabled():
-        try:
-            return supabase_get_all_statuses()
-        except Exception:
-            return sqlite_get_all_statuses()
-    return sqlite_get_all_statuses()
-
-def set_status(rom: str, status: str | None) -> None:
-    if supabase_enabled():
-        try:
-            return supabase_set_status(rom, status)
-        except Exception:
-            return sqlite_set_status(rom, status)
-    return sqlite_set_status(rom, status)
+def _supabase_get_note(rom: str) -> str:
+    rows = _sb_request("GET", "game_notes", {"select": "note", "rom": f"eq.{rom}", "limit": "1"}) or []
+    if not rows:
+        return ""
+    return rows[0].get("note") or ""
 
 def get_note(rom: str) -> str:
     rom = (rom or "").strip().lower()
     if not rom:
         return ""
+    if SUPABASE_ENABLED:
+        try:
+            return _supabase_get_note(rom)
+        except Exception:
+            pass
+    return _sqlite_get_note(rom)
+
+def _sqlite_set_note(rom: str, note: str) -> None:
     conn = get_db()
-    try:
-        cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
-        row = cur.fetchone()
-        return row[0] if row and row[0] is not None else ""
-    finally:
-        conn.close()
+    conn.execute(
+        """
+        INSERT INTO game_notes (rom, note, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(rom) DO UPDATE SET
+            note=excluded.note,
+            updated_at=datetime('now')
+        """,
+        (rom, note),
+    )
+    conn.commit()
+    conn.close()
+
+def _supabase_set_note(rom: str, note: str) -> None:
+    _sb_request(
+        "POST",
+        "game_notes",
+        payload={"rom": rom, "note": note},
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
 
 def set_note(rom: str, note: str) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
-    conn = get_db()
-    try:
-        conn.execute(
-            """
-            INSERT INTO game_notes (rom, note, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(rom) DO UPDATE SET
-                note=excluded.note,
-                updated_at=datetime('now')
-            """,
-            (rom, note),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
+    if SUPABASE_ENABLED:
+        try:
+            _supabase_set_note(rom, note)
+            return
+        except Exception:
+            pass
+    _sqlite_set_note(rom, note)
 # ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
-
 def normalize_str(x) -> str:
     if pd.isna(x):
         return ""
@@ -574,26 +612,6 @@ def update_status(rom: str, new_status: str | None):
     else:
         st.session_state.status_cache[rom] = new_status
 
-
-def build_want_to_play_txt(df: pd.DataFrame) -> str:
-    want_roms = sorted([rom for rom, status in st.session_state.status_cache.items() if status == STATUS_WANT])
-    if not want_roms:
-        return ""
-    rows = df[df["rom"].isin(want_roms)].copy()
-    if rows.empty:
-        return "\n".join(want_roms)
-    rows = rows.sort_values(["year", "game"])
-    lines = []
-    for _, row in rows.iterrows():
-        game = normalize_str(row.get("game", ""))
-        rom = normalize_str(row.get("rom", "")).lower()
-        year = normalize_str(row.get("year", ""))
-        company = normalize_str(row.get("company", ""))
-        lines.append(f"{game} | {rom} | {year} | {company}")
-    extra = [rom for rom in want_roms if rom not in set(rows["rom"].tolist())]
-    lines.extend(extra)
-    return "\n".join(lines)
-
 # ----------------------------
 # Details panel
 # ----------------------------
@@ -605,8 +623,7 @@ def show_game_details(row: pd.Series):
     platform = normalize_str(row.get("platform", ""))
     rom = normalize_str(row.get("rom", "")).lower()
 
-    if show_marquees:
-        show_marquee(rom)
+    show_marquee(rom)
 
     # Status controls
     cur_status = status_for_rom(rom)
@@ -614,7 +631,7 @@ def show_game_details(row: pd.Series):
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
     st.caption(CABINET_SUMMARY)
 
-    s1, s2, s3, s4, s5 = st.columns([1, 1, 1, 1, 1])
+    s1, s2, s3 = st.columns([1, 1, 1])
     with s1:
         if st.button("⏳ Want to Play", use_container_width=True, key=f"st_want_{rom}"):
             update_status(rom, STATUS_WANT)
@@ -624,14 +641,6 @@ def show_game_details(row: pd.Series):
             update_status(rom, STATUS_PLAYED)
             st.rerun()
     with s3:
-        if st.button("🧩 No ROM", use_container_width=True, key=f"st_norom_{rom}"):
-            update_status(rom, STATUS_NO_ROM)
-            st.rerun()
-    with s4:
-        if st.button("🚫 Can't play", use_container_width=True, key=f"st_np_{rom}"):
-            update_status(rom, STATUS_NOT_PLAYABLE)
-            st.rerun()
-    with s5:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
             st.rerun()
@@ -684,7 +693,7 @@ def show_game_details(row: pd.Series):
             if st.button("💾 Save notes", use_container_width=True, key=f"note_save_{rom or game_key(row)}"):
                 if rom:
                     set_note(rom, st.session_state[note_key])
-                    st.success("Notes saved.")
+                    st.success("Notes saved." if not SUPABASE_ENABLED else "Notes saved (Supabase-first).")
                 else:
                     st.warning("Notes require a ROM short name for this entry.")
         with n2:
@@ -726,6 +735,10 @@ load_status_cache_once()
 # ----------------------------
 st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
+if SUPABASE_ENABLED:
+    st.sidebar.caption("Supabase: connected")
+else:
+    st.sidebar.caption("Supabase: not configured or unavailable — using SQLite fallback")
 
 strict_mode = st.sidebar.toggle("STRICT: only show cabinet-playable games", value=True)
 
@@ -734,21 +747,6 @@ st.sidebar.header("✅ Status filters")
 
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
-only_played = st.sidebar.toggle("Show only ✅ Played", value=False)
-show_no_rom = st.sidebar.toggle("Include 🧩 Don't have ROM", value=False)
-show_not_playable = st.sidebar.toggle("Include 🚫 Not playable", value=False)
-
-st.sidebar.markdown("---")
-show_marquees = st.sidebar.toggle("Show marquees", value=True)
-
-want_count = sum(1 for s in st.session_state.status_cache.values() if s == STATUS_WANT)
-st.sidebar.download_button(
-    label=f"📤 Export Want to Play ({want_count})",
-    data=build_want_to_play_txt(df),
-    file_name="arcade_want_to_play.txt",
-    mime="text/plain",
-    use_container_width=True,
-)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
@@ -785,15 +783,9 @@ if strict_mode:
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
-    if only_played:
-        return s == STATUS_PLAYED
     if only_want:
         return s == STATUS_WANT
     if hide_played and s == STATUS_PLAYED:
-        return False
-    if (not show_no_rom) and s == STATUS_NO_ROM:
-        return False
-    if (not show_not_playable) and s == STATUS_NOT_PLAYABLE:
         return False
     return True
 
