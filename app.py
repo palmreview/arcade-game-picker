@@ -26,7 +26,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.1 • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • Global status via SQLite • No caching"
+APP_VERSION = "1.7.2 • Notes restored • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • Global status via SQLite • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -55,6 +55,15 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS game_status (
             rom TEXT PRIMARY KEY,
             status TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_notes (
+            rom TEXT PRIMARY KEY,
+            note TEXT,
             updated_at TEXT DEFAULT (datetime('now'))
         )
         """
@@ -104,6 +113,37 @@ def set_status(rom: str, status: str | None) -> None:
             """,
             (rom, status),
         )
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# Notes (local SQLite, per ROM)
+# ----------------------------
+def get_note(rom: str) -> str:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return ""
+    conn = get_db()
+    cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else ""
+
+def set_note(rom: str, note: str) -> None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO game_notes (rom, note, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(rom) DO UPDATE SET
+            note=excluded.note,
+            updated_at=datetime('now')
+        """,
+        (rom, note),
+    )
     conn.commit()
     conn.close()
 
@@ -492,6 +532,54 @@ def show_game_details(row: pd.Series):
         st.write(f"**Platform:** {platform}")
     if rom:
         st.write(f"**ROM (MAME short name):** `{rom}`")
+
+    with st.expander("📝 Notes", expanded=False):
+        current_note = get_note(rom) if rom else ""
+        note_key = f"note_text_{rom or game_key(row)}"
+        if note_key not in st.session_state:
+            st.session_state[note_key] = current_note
+
+        uploaded = st.file_uploader(
+            "Import notes (.txt, .md, .json)",
+            type=["txt", "md", "json"],
+            key=f"note_upload_{rom or game_key(row)}",
+            help="Upload a text-like file and paste it into the notes area.",
+        )
+        append_import = st.toggle("Append imported text", value=False, key=f"note_append_{rom or game_key(row)}")
+        if uploaded is not None:
+            try:
+                imported_text = uploaded.read().decode("utf-8", errors="replace")
+                if append_import and st.session_state[note_key].strip():
+                    sep = "\n\n" if not st.session_state[note_key].endswith("\n") else "\n"
+                    st.session_state[note_key] = st.session_state[note_key] + sep + imported_text
+                else:
+                    st.session_state[note_key] = imported_text
+                st.success("Imported into notes editor. Save notes to keep it.")
+            except Exception as e:
+                st.error(f"Could not import notes: {e}")
+
+        st.session_state[note_key] = st.text_area(
+            "Your notes",
+            value=st.session_state[note_key],
+            height=220,
+            key=f"note_editor_{rom or game_key(row)}",
+            placeholder="Paste your research notes here...",
+        )
+
+        n1, n2 = st.columns(2)
+        with n1:
+            if st.button("💾 Save notes", use_container_width=True, key=f"note_save_{rom or game_key(row)}"):
+                if rom:
+                    set_note(rom, st.session_state[note_key])
+                    st.success("Notes saved.")
+                else:
+                    st.warning("Notes require a ROM short name for this entry.")
+        with n2:
+            if st.button("🧽 Clear notes", use_container_width=True, key=f"note_clear_{rom or game_key(row)}"):
+                st.session_state[note_key] = ""
+                if rom:
+                    set_note(rom, "")
+                st.rerun()
 
     with st.expander("🔗 Research links", expanded=False):
         for name, url in build_links(g).items():
