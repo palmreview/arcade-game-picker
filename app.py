@@ -44,12 +44,7 @@ STATUS_LABELS = {
 # ----------------------------
 # DB (global state across devices)
 # ----------------------------
-def get_db() -> sqlite3.Connection:
-    # check_same_thread False is fine for Streamlit single-process usage
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_db() -> None:
-    conn = get_db()
+def ensure_db_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS game_status (
@@ -69,6 +64,17 @@ def init_db() -> None:
         """
     )
     conn.commit()
+
+
+def get_db() -> sqlite3.Connection:
+    # check_same_thread False is fine for Streamlit single-process usage
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    ensure_db_schema(conn)
+    return conn
+
+
+def init_db() -> None:
+    conn = get_db()
     conn.close()
 
 def get_all_statuses() -> dict[str, str]:
@@ -76,9 +82,15 @@ def get_all_statuses() -> dict[str, str]:
     Returns mapping: rom -> status
     """
     conn = get_db()
-    cur = conn.execute("SELECT rom, status FROM game_status")
-    rows = cur.fetchall()
-    conn.close()
+    try:
+        cur = conn.execute("SELECT rom, status FROM game_status")
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        ensure_db_schema(conn)
+        cur = conn.execute("SELECT rom, status FROM game_status")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
     out = {}
     for rom, status in rows:
         if rom:
@@ -90,31 +102,56 @@ def get_status(rom: str) -> str | None:
     if not rom:
         return None
     conn = get_db()
-    cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
+    try:
+        cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except sqlite3.OperationalError:
+        ensure_db_schema(conn)
+        cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
     conn = get_db()
-    if status is None:
-        conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
-    else:
-        conn.execute(
-            """
-            INSERT INTO game_status (rom, status, updated_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(rom) DO UPDATE SET
-                status=excluded.status,
-                updated_at=datetime('now')
-            """,
-            (rom, status),
-        )
-    conn.commit()
-    conn.close()
+    try:
+        if status is None:
+            conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
+        else:
+            conn.execute(
+                """
+                INSERT INTO game_status (rom, status, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(rom) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=datetime('now')
+                """,
+                (rom, status),
+            )
+        conn.commit()
+    except sqlite3.OperationalError:
+        ensure_db_schema(conn)
+        if status is None:
+            conn.execute("DELETE FROM game_status WHERE rom=?", (rom,))
+        else:
+            conn.execute(
+                """
+                INSERT INTO game_status (rom, status, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(rom) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=datetime('now')
+                """,
+                (rom, status),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 # ----------------------------
 # Notes (local SQLite, per ROM)
@@ -124,28 +161,50 @@ def get_note(rom: str) -> str:
     if not rom:
         return ""
     conn = get_db()
-    cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row and row[0] is not None else ""
+    try:
+        cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else ""
+    except sqlite3.OperationalError:
+        ensure_db_schema(conn)
+        cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else ""
+    finally:
+        conn.close()
 
 def set_note(rom: str, note: str) -> None:
     rom = (rom or "").strip().lower()
     if not rom:
         return
     conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO game_notes (rom, note, updated_at)
-        VALUES (?, ?, datetime('now'))
-        ON CONFLICT(rom) DO UPDATE SET
-            note=excluded.note,
-            updated_at=datetime('now')
-        """,
-        (rom, note),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO game_notes (rom, note, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(rom) DO UPDATE SET
+                note=excluded.note,
+                updated_at=datetime('now')
+            """,
+            (rom, note),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        ensure_db_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO game_notes (rom, note, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(rom) DO UPDATE SET
+                note=excluded.note,
+                updated_at=datetime('now')
+            """,
+            (rom, note),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 # ----------------------------
 # Helpers: normalization / dataset
