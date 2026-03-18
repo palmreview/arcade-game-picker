@@ -28,7 +28,7 @@ st.caption(
 # Constants
 # ----------------------------
 TZ = ZoneInfo("America/New_York")
-APP_VERSION = "1.7.3 • Notes moved to Supabase-first • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • SQLite fallback • No caching"
+APP_VERSION = "1.7.4 • Restored No ROM / Not Playable flags + filters • Notes moved to Supabase-first • Marquee fallback restored • Collapsible research links • Collapsible ADB • Strict Cabinet Mode • SQLite fallback • No caching"
 
 CSV_PATH = "arcade_games_1978_2008_clean.csv"
 DB_PATH = "game_state.db"
@@ -43,6 +43,14 @@ STATUS_LABELS = {
     STATUS_PLAYED: "✅ Played",
 }
 
+FLAG_NO_ROM = "no_rom"
+FLAG_NOT_PLAYABLE = "not_playable"
+
+FLAG_LABELS = {
+    FLAG_NO_ROM: "🚫 No ROM",
+    FLAG_NOT_PLAYABLE: "⛔ Not Playable",
+}
+
 # ----------------------------
 # Persistence: Supabase first, SQLite fallback
 # ----------------------------
@@ -55,12 +63,15 @@ def _secret_or_env(name: str, default: str = "") -> str:
         pass
     return os.environ.get(name, default)
 
+
 SUPABASE_URL = _secret_or_env("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = _secret_or_env("SUPABASE_KEY", "") or _secret_or_env("SUPABASE_ANON_KEY", "")
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
+
 def get_db() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db() -> None:
     conn = get_db()
@@ -82,8 +93,19 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_flags (
+            rom TEXT PRIMARY KEY,
+            no_rom INTEGER DEFAULT 0,
+            not_playable INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
 
 def _sb_headers(prefer: str | None = None) -> dict:
     headers = {
@@ -94,6 +116,7 @@ def _sb_headers(prefer: str | None = None) -> dict:
     if prefer:
         headers["Prefer"] = prefer
     return headers
+
 
 def _sb_request(method: str, path: str, params: dict | None = None, payload=None, prefer: str | None = None):
     if not SUPABASE_ENABLED:
@@ -119,6 +142,7 @@ def _sb_request(method: str, path: str, params: dict | None = None, payload=None
     except URLError as e:
         raise RuntimeError(f"Supabase network error: {e}") from e
 
+
 def _sqlite_get_all_statuses() -> dict[str, str]:
     conn = get_db()
     cur = conn.execute("SELECT rom, status FROM game_status")
@@ -130,6 +154,7 @@ def _sqlite_get_all_statuses() -> dict[str, str]:
             out[str(rom).strip().lower()] = status
     return out
 
+
 def _supabase_get_all_statuses() -> dict[str, str]:
     rows = _sb_request("GET", "game_status", {"select": "rom,status", "limit": "5000"}) or []
     out = {}
@@ -140,6 +165,7 @@ def _supabase_get_all_statuses() -> dict[str, str]:
             out[rom] = status
     return out
 
+
 def get_all_statuses() -> dict[str, str]:
     if SUPABASE_ENABLED:
         try:
@@ -148,6 +174,7 @@ def get_all_statuses() -> dict[str, str]:
             pass
     return _sqlite_get_all_statuses()
 
+
 def _sqlite_get_status(rom: str) -> str | None:
     conn = get_db()
     cur = conn.execute("SELECT status FROM game_status WHERE rom=?", (rom,))
@@ -155,9 +182,11 @@ def _sqlite_get_status(rom: str) -> str | None:
     conn.close()
     return row[0] if row else None
 
+
 def _supabase_get_status(rom: str) -> str | None:
     rows = _sb_request("GET", "game_status", {"select": "status", "rom": f"eq.{rom}", "limit": "1"}) or []
     return rows[0].get("status") if rows else None
+
 
 def get_status(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
@@ -169,6 +198,7 @@ def get_status(rom: str) -> str | None:
         except Exception:
             pass
     return _sqlite_get_status(rom)
+
 
 def _sqlite_set_status(rom: str, status: str | None) -> None:
     conn = get_db()
@@ -188,6 +218,7 @@ def _sqlite_set_status(rom: str, status: str | None) -> None:
     conn.commit()
     conn.close()
 
+
 def _supabase_set_status(rom: str, status: str | None) -> None:
     if status is None:
         _sb_request("DELETE", "game_status", {"rom": f"eq.{rom}"})
@@ -198,6 +229,7 @@ def _supabase_set_status(rom: str, status: str | None) -> None:
             payload={"rom": rom, "status": status},
             prefer="resolution=merge-duplicates,return=minimal",
         )
+
 
 def set_status(rom: str, status: str | None) -> None:
     rom = (rom or "").strip().lower()
@@ -211,6 +243,7 @@ def set_status(rom: str, status: str | None) -> None:
             pass
     _sqlite_set_status(rom, status)
 
+
 def _sqlite_get_note(rom: str) -> str:
     conn = get_db()
     cur = conn.execute("SELECT note FROM game_notes WHERE rom=?", (rom,))
@@ -218,11 +251,13 @@ def _sqlite_get_note(rom: str) -> str:
     conn.close()
     return row[0] if row and row[0] is not None else ""
 
+
 def _supabase_get_note(rom: str) -> str:
     rows = _sb_request("GET", "game_notes", {"select": "note", "rom": f"eq.{rom}", "limit": "1"}) or []
     if not rows:
         return ""
     return rows[0].get("note") or ""
+
 
 def get_note(rom: str) -> str:
     rom = (rom or "").strip().lower()
@@ -234,6 +269,7 @@ def get_note(rom: str) -> str:
         except Exception:
             pass
     return _sqlite_get_note(rom)
+
 
 def _sqlite_set_note(rom: str, note: str) -> None:
     conn = get_db()
@@ -250,6 +286,7 @@ def _sqlite_set_note(rom: str, note: str) -> None:
     conn.commit()
     conn.close()
 
+
 def _supabase_set_note(rom: str, note: str) -> None:
     _sb_request(
         "POST",
@@ -257,6 +294,7 @@ def _supabase_set_note(rom: str, note: str) -> None:
         payload={"rom": rom, "note": note},
         prefer="resolution=merge-duplicates,return=minimal",
     )
+
 
 def set_note(rom: str, note: str) -> None:
     rom = (rom or "").strip().lower()
@@ -269,6 +307,111 @@ def set_note(rom: str, note: str) -> None:
         except Exception:
             pass
     _sqlite_set_note(rom, note)
+
+
+def _sqlite_get_all_flags() -> dict[str, dict[str, bool]]:
+    conn = get_db()
+    cur = conn.execute("SELECT rom, no_rom, not_playable FROM game_flags")
+    rows = cur.fetchall()
+    conn.close()
+    out = {}
+    for rom, no_rom, not_playable in rows:
+        rom = str(rom or "").strip().lower()
+        if rom:
+            out[rom] = {
+                FLAG_NO_ROM: bool(no_rom),
+                FLAG_NOT_PLAYABLE: bool(not_playable),
+            }
+    return out
+
+
+def _supabase_get_all_flags() -> dict[str, dict[str, bool]]:
+    rows = _sb_request("GET", "game_flags", {"select": "rom,no_rom,not_playable", "limit": "5000"}) or []
+    out = {}
+    for row in rows:
+        rom = str(row.get("rom", "")).strip().lower()
+        if rom:
+            out[rom] = {
+                FLAG_NO_ROM: bool(row.get("no_rom")),
+                FLAG_NOT_PLAYABLE: bool(row.get("not_playable")),
+            }
+    return out
+
+
+def get_all_flags() -> dict[str, dict[str, bool]]:
+    if SUPABASE_ENABLED:
+        try:
+            return _supabase_get_all_flags()
+        except Exception:
+            pass
+    return _sqlite_get_all_flags()
+
+
+def _sqlite_set_flag(rom: str, flag_name: str, enabled: bool) -> None:
+    rom = (rom or "").strip().lower()
+    if not rom or flag_name not in (FLAG_NO_ROM, FLAG_NOT_PLAYABLE):
+        return
+    col = "no_rom" if flag_name == FLAG_NO_ROM else "not_playable"
+    conn = get_db()
+    conn.execute(
+        f"""
+        INSERT INTO game_flags (rom, {col}, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(rom) DO UPDATE SET
+            {col}=excluded.{col},
+            updated_at=datetime('now')
+        """,
+        (rom, 1 if enabled else 0),
+    )
+    conn.execute(
+        "DELETE FROM game_flags WHERE rom=? AND COALESCE(no_rom,0)=0 AND COALESCE(not_playable,0)=0",
+        (rom,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _supabase_set_flag(rom: str, flag_name: str, enabled: bool) -> None:
+    existing = _sb_request("GET", "game_flags", {"select": "rom,no_rom,not_playable", "rom": f"eq.{rom}", "limit": "1"}) or []
+    current = existing[0] if existing else {"rom": rom, "no_rom": False, "not_playable": False}
+
+    if flag_name == FLAG_NO_ROM:
+        current["no_rom"] = bool(enabled)
+    elif flag_name == FLAG_NOT_PLAYABLE:
+        current["not_playable"] = bool(enabled)
+    else:
+        return
+
+    if not current.get("no_rom") and not current.get("not_playable"):
+        _sb_request("DELETE", "game_flags", {"rom": f"eq.{rom}"})
+        return
+
+    payload = {
+        "rom": rom,
+        "no_rom": bool(current.get("no_rom")),
+        "not_playable": bool(current.get("not_playable")),
+    }
+    _sb_request(
+        "POST",
+        "game_flags",
+        payload=payload,
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+def set_flag(rom: str, flag_name: str, enabled: bool) -> None:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+    if SUPABASE_ENABLED:
+        try:
+            _supabase_set_flag(rom, flag_name, enabled)
+            return
+        except Exception:
+            pass
+    _sqlite_set_flag(rom, flag_name, enabled)
+
+
 # ----------------------------
 # Helpers: normalization / dataset
 # ----------------------------
@@ -276,6 +419,7 @@ def normalize_str(x) -> str:
     if pd.isna(x):
         return ""
     return str(x).strip()
+
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["rom", "game", "year", "company", "genre", "platform"]:
@@ -299,9 +443,11 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def load_games_no_cache() -> pd.DataFrame:
     df = pd.read_csv(CSV_PATH)
     return ensure_columns(df)
+
 
 def build_links(game_name: str):
     q = game_name.replace(" ", "+")
@@ -313,11 +459,13 @@ def build_links(game_name: str):
         "Ports / Collections (search)": f"https://www.google.com/search?q={q}+arcade+collection+port",
     }
 
+
 def game_key(row: pd.Series) -> str:
     rom = normalize_str(row.get("rom", "")).lower()
     if rom:
         return f"rom:{rom}"
-    return f"meta:{normalize_str(row.get('game',''))}|{int(row.get('year',0))}|{normalize_str(row.get('company',''))}"
+    return f"meta:{normalize_str(row.get('game', ''))}|{int(row.get('year', 0))}|{normalize_str(row.get('company', ''))}"
+
 
 def init_state():
     if "picked_rows" not in st.session_state:
@@ -330,8 +478,13 @@ def init_state():
         st.session_state.status_cache = {}
     if "status_cache_loaded" not in st.session_state:
         st.session_state.status_cache_loaded = False
+    if "flag_cache" not in st.session_state:
+        st.session_state.flag_cache = {}
+    if "flag_cache_loaded" not in st.session_state:
+        st.session_state.flag_cache_loaded = False
     if "marquee_bytes_cache" not in st.session_state:
         st.session_state.marquee_bytes_cache = {}
+
 
 # ----------------------------
 # Cabinet profile + strict compatibility
@@ -370,6 +523,7 @@ BLOCKED_TITLE_HINTS = [
     "paddle",
 ]
 
+
 def is_cabinet_compatible_strict(row: pd.Series) -> bool:
     genre = normalize_str(row.get("genre", "")).strip().lower()
     title = normalize_str(row.get("game", "")).strip().lower()
@@ -394,6 +548,7 @@ def is_cabinet_compatible_strict(row: pd.Series) -> bool:
 
     return True
 
+
 # ----------------------------
 # Streamlit image helper (compat)
 # ----------------------------
@@ -402,6 +557,7 @@ def _st_image(data, *, caption: str | None = None):
         st.image(data, caption=caption, use_container_width=True)
     except TypeError:
         st.image(data, caption=caption, use_column_width=True)
+
 
 # ----------------------------
 # Marquees (R2) - ROM image, fallback to default.png
@@ -412,8 +568,10 @@ def marquee_url(rom: str) -> str:
         return f"{R2_PUBLIC_ROOT}/default.png"
     return f"{R2_PUBLIC_ROOT}/{rom}.png"
 
+
 def default_marquee_url() -> str:
     return f"{R2_PUBLIC_ROOT}/default.png"
+
 
 def fetch_image_bytes(url: str, timeout_sec: int = 10) -> bytes | None:
     cache: dict = st.session_state.marquee_bytes_cache
@@ -429,6 +587,7 @@ def fetch_image_bytes(url: str, timeout_sec: int = 10) -> bytes | None:
         cache[url] = None
         return None
 
+
 def show_marquee(rom: str):
     rom = (rom or "").strip().lower()
 
@@ -441,6 +600,7 @@ def show_marquee(rom: str):
     b2 = fetch_image_bytes(default_marquee_url(), timeout_sec=10)
     if b2:
         _st_image(b2)
+
 
 # ----------------------------
 # ADB (ArcadeItalia) on-demand integration
@@ -460,6 +620,7 @@ def adb_urls(rom: str):
         "scraper_http": scraper_http,
     }
 
+
 def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     req = Request(
         url,
@@ -475,6 +636,7 @@ def fetch_json_url(url: str, timeout_sec: int = 12) -> dict:
     if isinstance(data, dict):
         return data
     return {"_data": data}
+
 
 def fetch_adb_details(rom: str) -> dict:
     rom = (rom or "").strip().lower()
@@ -503,6 +665,7 @@ def fetch_adb_details(rom: str) -> dict:
     st.session_state.adb_cache[rom] = out
     return out
 
+
 def extract_image_urls(obj) -> list[str]:
     urls = []
 
@@ -528,6 +691,7 @@ def extract_image_urls(obj) -> list[str]:
             seen.add(u)
             out.append(u)
     return out
+
 
 def show_adb_block(rom: str):
     rom = (rom or "").strip().lower()
@@ -587,13 +751,15 @@ def show_adb_block(rom: str):
 
     return data
 
+
 # ----------------------------
-# Status UI + caching
+# Status / flag UI + caching
 # ----------------------------
 def load_status_cache_once():
     if not st.session_state.status_cache_loaded:
         st.session_state.status_cache = get_all_statuses()
         st.session_state.status_cache_loaded = True
+
 
 def status_for_rom(rom: str) -> str | None:
     rom = (rom or "").strip().lower()
@@ -601,16 +767,51 @@ def status_for_rom(rom: str) -> str | None:
         return None
     return st.session_state.status_cache.get(rom)
 
+
 def update_status(rom: str, new_status: str | None):
     rom = (rom or "").strip().lower()
     if not rom:
         return
     set_status(rom, new_status)
-    # Update in-memory cache immediately
     if new_status is None:
         st.session_state.status_cache.pop(rom, None)
     else:
         st.session_state.status_cache[rom] = new_status
+
+
+def load_flag_cache_once():
+    if not st.session_state.flag_cache_loaded:
+        st.session_state.flag_cache = get_all_flags()
+        st.session_state.flag_cache_loaded = True
+
+
+def flags_for_rom(rom: str) -> dict[str, bool]:
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return {FLAG_NO_ROM: False, FLAG_NOT_PLAYABLE: False}
+    existing = st.session_state.flag_cache.get(rom, {})
+    return {
+        FLAG_NO_ROM: bool(existing.get(FLAG_NO_ROM, False)),
+        FLAG_NOT_PLAYABLE: bool(existing.get(FLAG_NOT_PLAYABLE, False)),
+    }
+
+
+def flag_enabled(rom: str, flag_name: str) -> bool:
+    return bool(flags_for_rom(rom).get(flag_name, False))
+
+
+def update_flag(rom: str, flag_name: str, enabled: bool):
+    rom = (rom or "").strip().lower()
+    if not rom:
+        return
+    set_flag(rom, flag_name, enabled)
+    current = flags_for_rom(rom)
+    current[flag_name] = bool(enabled)
+    if not current.get(FLAG_NO_ROM) and not current.get(FLAG_NOT_PLAYABLE):
+        st.session_state.flag_cache.pop(rom, None)
+    else:
+        st.session_state.flag_cache[rom] = current
+
 
 # ----------------------------
 # Details panel
@@ -625,10 +826,14 @@ def show_game_details(row: pd.Series):
 
     show_marquee(rom)
 
-    # Status controls
     cur_status = status_for_rom(rom)
+    cur_flags = flags_for_rom(rom)
+
     st.markdown(f"## {g}")
     st.write(f"**Status:** {STATUS_LABELS.get(cur_status, '—')}")
+    active_flags = [label for key, label in FLAG_LABELS.items() if cur_flags.get(key)]
+    if active_flags:
+        st.write(f"**Flags:** {' • '.join(active_flags)}")
     st.caption(CABINET_SUMMARY)
 
     s1, s2, s3 = st.columns([1, 1, 1])
@@ -643,6 +848,28 @@ def show_game_details(row: pd.Series):
     with s3:
         if st.button("🧽 Clear", use_container_width=True, key=f"st_clear_{rom}"):
             update_status(rom, None)
+            st.rerun()
+
+    f1, f2 = st.columns(2)
+    with f1:
+        no_rom_now = cur_flags.get(FLAG_NO_ROM, False)
+        if st.button(
+            "✅ Unmark No ROM" if no_rom_now else "🚫 Mark No ROM",
+            use_container_width=True,
+            key=f"flag_no_rom_{rom}",
+            disabled=not bool(rom),
+        ):
+            update_flag(rom, FLAG_NO_ROM, not no_rom_now)
+            st.rerun()
+    with f2:
+        not_playable_now = cur_flags.get(FLAG_NOT_PLAYABLE, False)
+        if st.button(
+            "✅ Unmark Not Playable" if not_playable_now else "⛔ Mark Not Playable",
+            use_container_width=True,
+            key=f"flag_not_playable_{rom}",
+            disabled=not bool(rom),
+        ):
+            update_flag(rom, FLAG_NOT_PLAYABLE, not not_playable_now)
             st.rerun()
 
     st.write(f"**Year:** {y}")
@@ -710,13 +937,13 @@ def show_game_details(row: pd.Series):
     with st.expander("📚 Arcade Database (ADB) details + artwork (on-demand)", expanded=False):
         show_adb_block(rom)
 
+
 # ----------------------------
 # Boot app
 # ----------------------------
 init_state()
 init_db()
 
-# Load dataset (no caching)
 try:
     df = load_games_no_cache()
 except FileNotFoundError:
@@ -727,11 +954,12 @@ except Exception as e:
     st.code(str(e))
     st.stop()
 
-# Load status cache once per session (global data)
 load_status_cache_once()
+load_flag_cache_once()
+
 
 # ----------------------------
-# Sidebar: Cabinet mode + status filtering
+# Sidebar: Cabinet mode + filtering
 # ----------------------------
 st.sidebar.header("🎛️ Cabinet Mode")
 st.sidebar.caption(APP_VERSION)
@@ -747,6 +975,14 @@ st.sidebar.header("✅ Status filters")
 
 hide_played = st.sidebar.toggle("Hide ✅ Played", value=True)
 only_want = st.sidebar.toggle("Show only ⏳ Want to Play", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🚩 ROM / playability filters")
+
+hide_no_rom = st.sidebar.toggle("Hide 🚫 No ROM", value=False)
+only_no_rom = st.sidebar.toggle("Show only 🚫 No ROM", value=False)
+hide_not_playable = st.sidebar.toggle("Hide ⛔ Not Playable", value=False)
+only_not_playable = st.sidebar.toggle("Show only ⛔ Not Playable", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Filters")
@@ -766,6 +1002,7 @@ try:
 except Exception:
     pass
 
+
 # ----------------------------
 # Build filtered view
 # ----------------------------
@@ -779,18 +1016,30 @@ if genre_choice:
 if strict_mode:
     base = base[base.apply(is_cabinet_compatible_strict, axis=1)]
 
-# Apply status filters
+
 def keep_by_status(row: pd.Series) -> bool:
     rom = normalize_str(row.get("rom", "")).lower()
     s = status_for_rom(rom)
-    if only_want:
-        return s == STATUS_WANT
+    if only_want and s != STATUS_WANT:
+        return False
     if hide_played and s == STATUS_PLAYED:
+        return False
+
+    flags = flags_for_rom(rom)
+    if only_no_rom and not flags.get(FLAG_NO_ROM, False):
+        return False
+    if hide_no_rom and flags.get(FLAG_NO_ROM, False):
+        return False
+    if only_not_playable and not flags.get(FLAG_NOT_PLAYABLE, False):
+        return False
+    if hide_not_playable and flags.get(FLAG_NOT_PLAYABLE, False):
         return False
     return True
 
+
 base = base[base.apply(keep_by_status, axis=1)].copy()
 base = base.sort_values(["year", "game"]).reset_index(drop=True)
+
 
 # ----------------------------
 # Search
@@ -809,6 +1058,7 @@ else:
 
 st.write(f"Matches: **{len(hits):,}**")
 st.divider()
+
 
 # ----------------------------
 # Two-panel layout
@@ -864,9 +1114,11 @@ with left:
     st.markdown("---")
     st.markdown("## 📜 Browse list")
 
-    # Add status column for display
     view = hits[["rom", "game", "year", "company", "genre", "platform"]].copy()
     view["status"] = view["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
+    view["flags"] = view["rom"].apply(
+        lambda r: " • ".join([label for key, label in FLAG_LABELS.items() if flag_enabled(str(r).lower(), key)]) or "—"
+    )
 
     st.dataframe(view, use_container_width=True, height=420)
 
@@ -897,6 +1149,9 @@ with left:
         pick_df = pd.DataFrame(st.session_state.picked_rows)
         pick_df = pick_df[["rom", "game", "year", "company", "genre", "platform"]].copy()
         pick_df["status"] = pick_df["rom"].apply(lambda r: STATUS_LABELS.get(status_for_rom(str(r).lower()), "—"))
+        pick_df["flags"] = pick_df["rom"].apply(
+            lambda r: " • ".join([label for key, label in FLAG_LABELS.items() if flag_enabled(str(r).lower(), key)]) or "—"
+        )
 
         for i, r in pick_df.iterrows():
             label = f"{r['game']} ({int(r['year'])}) — {r['status']}"
@@ -919,7 +1174,6 @@ with right:
             else:
                 show_game_details(match.iloc[0])
         else:
-            # meta fallback (rare)
             try:
                 _, meta = key.split("meta:", 1)
                 title, year_str, company = meta.split("|", 2)
