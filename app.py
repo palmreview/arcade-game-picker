@@ -1185,14 +1185,28 @@ with left:
 
         # ── Game Cards browse list ──
         st.markdown("##### 📜 Browse")
+        inline_search = st.text_input(
+            "Search",
+            key="inline_search",
+            placeholder="🔍  Type a game name or ROM (e.g. Street Fighter, sf2...)",
+            label_visibility="collapsed",
+        )
 
-        if len(hits) == 0:
-            st.info("No results. Adjust filters or search.")
+        if inline_search.strip():
+            sq = inline_search.strip().lower()
+            browse_hits = hits[
+                hits["_game_l"].str.contains(sq, na=False)
+                | hits["rom"].astype(str).str.lower().str.contains(sq, na=False)
+            ].copy()
         else:
-            # Show top 80 as cards; selectbox for full list
-            card_limit = 80
-            card_rows  = hits.head(card_limit)
+            browse_hits = hits.copy()
 
+        card_limit = 20
+        card_rows  = browse_hits.head(card_limit)
+
+        if len(browse_hits) == 0:
+            st.info("No results. Try a different search term or adjust filters.")
+        else:
             for _, row in card_rows.iterrows():
                 rom_val  = normalize_str(row.get("rom", "")).lower()
                 s        = status_for_rom(rom_val)
@@ -1213,8 +1227,8 @@ with left:
                     st.session_state.selected_key = game_key(row)
                     st.rerun()
 
-            if len(hits) > card_limit:
-                st.caption(f"Showing first {card_limit} of {len(hits):,}. Use search or filters to narrow down.")
+            if len(browse_hits) > card_limit:
+                st.caption(f"Showing {card_limit} of {len(browse_hits):,} — type above to narrow down.")
 
         # Selectbox for full list
         st.markdown("##### Or select from full list")
